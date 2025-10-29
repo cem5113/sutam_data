@@ -2,16 +2,33 @@
 # -*- coding: utf-8 -*-
 
 """
-make_labels_and_priors_xl.py
-- Büyük veriler (≈2M satır, 70 sütun) için optimize etiket + prior üretimi
-- 2 geçiş: (1) minimal okuma ile crime_count & Y_label, (2) yan özellikler partiler halinde
-- Leakage-safe rolling priors (3m/12m) — geleceğe bakmaz (shift(1))
-- Varsayılan: full grid KAPALI (isteğe bağlı aç)
+make_labels_and_priors_xl.py  (REVİZE)
+- Girdi: fr_crime_09.parquet (zenginleştirilmiş tek dosya)
+- Çıktı: sf_crime_grid_full_labeled.parquet (+ opsiyonel paketleme)
+
+Ne yapar?
+  1) GEOID×saat bazında crime_count ve Y_label üretir (event-level ise sayar; crime_count varsa toplar)
+  2) Leakage-safe rolling priors (3m/12m): (GEOID, day_of_week, hour, season) kırılımında geçmişe bakar
+  3) İstenirse hazır risky_hours.parquet ve metrics_stacking_ohe.parquet dosyalarını doğrular, out_dir'e kopyalar
+  4) İstenirse hepsini tek ZIP içinde paketler (artifact)
+
+Kullanım örn:
+  python make_labels_and_priors_xl.py \
+    --input fr_crime_09.parquet \
+    --out outputs/sf_crime_grid_full_labeled.parquet \
+    --tz America/Los_Angeles \
+    --no-full-grid \
+    --risky-hours path/to/risky_hours.parquet \
+    --metrics path/to/metrics_stacking_ohe.parquet \
+    --out-dir outputs \
+    --package-zip outputs/fr-crime-outputs-parquet.zip
 """
 
 import argparse
+import shutil
+import zipfile
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -50,7 +67,7 @@ def _to_dt(df: pd.DataFrame) -> pd.Series:
         raise ValueError("Zaman kolonları çözümlenemedi (hepsi NaT).")
     return s.dt.floor("H")
 
-def _add_calendar(df: pd.DataFrame, tz: str | None) -> pd.DataFrame:
+def _add_calendar(df: pd.DataFrame, tz: Optional[str]) -> pd.DataFrame:
     if tz:
         df["dt_local"] = df["dt"].dt.tz_convert(tz)
         base = "dt_local"
@@ -80,20 +97,17 @@ def _prior_rolling(df: pd.DataFrame, window: str, suffix: str,
                    keys: Tuple[str,str,str]=("day_of_week","hour","season")) -> pd.DataFrame:
     df = df.sort_values(["GEOID","dt"]).copy()
     grp_cols = ["GEOID", *keys]
-
     def _roll(g: pd.DataFrame) -> pd.DataFrame:
         g = g.sort_values("dt").set_index("dt")
         cnt = g["Y_label"].rolling(window=window).sum().shift(1).fillna(0.0)
         g[f"prior_cnt_{suffix}"] = cnt.to_numpy().astype("float32")
         return g.reset_index()
-
     out = df.groupby(grp_cols, group_keys=False).apply(_roll)
     hours_in_window = float(pd.Timedelta(window) / pd.Timedelta("1H"))
     out[f"prior_p_{suffix}"] = (out[f"prior_cnt_{suffix}"] / hours_in_window).astype("float32")
     return out
 
 def _downcast_numeric(df: pd.DataFrame, prefer_float32=True) -> pd.DataFrame:
-    # basit downcast: int -> smallest, float -> float32
     for c in df.select_dtypes(include=["int64","int32"]).columns:
         df[c] = pd.to_numeric(df[c], downcast="integer")
     if prefer_float32:
@@ -101,19 +115,23 @@ def _downcast_numeric(df: pd.DataFrame, prefer_float32=True) -> pd.DataFrame:
             df[c] = df[c].astype("float32")
     return df
 
+def _safe_read_parquet_columns(p: Path, columns: Optional[List[str]] = None) -> pd.DataFrame:
+    # Bazı engine uyumsuzluklarına karşı tek noktadan okuma
+    return pd.read_parquet(p, columns=columns)
+
 # -------------------------
 # Geçiş-1: minimal okuma (crime_count & Y_label)
 # -------------------------
-def pass1_build_cc(input_path: Path, tz: str | None) -> pd.DataFrame:
-    # Sadece GEOID + zaman + (varsa crime_count) kolonlarını oku
+def pass1_build_cc(input_path: Path, tz: Optional[str]) -> pd.DataFrame:
     minimal_cols = ["GEOID","geoid","datetime","date","time","event_hour","received_time","crime_count"]
-    usecols = None  # parquet için 'columns' paramı kullanacağız
-    # Parquet ise kolon seçerek oku:
     if input_path.suffix.lower() == ".parquet":
-        # pyarrow backend kolon filtresi çalışır
-        raw = pd.read_parquet(input_path, columns=[c for c in minimal_cols if c])  # type: ignore
+        raw = _safe_read_parquet_columns(input_path, columns=[c for c in minimal_cols if c != ""])
     else:
-        raw = pd.read_csv(input_path, usecols=[c for c in minimal_cols if c in pd.read_csv(input_path, nrows=0).columns])
+        # CSV için: başlığı bir kez oku, sonra usecols filtrele
+        header = pd.read_csv(input_path, nrows=0).columns.tolist()
+        usecols = [c for c in minimal_cols if c in header]
+        raw = pd.read_csv(input_path, usecols=usecols)
+
     raw = _norm_geoid(raw)
     raw["dt"] = _to_dt(raw)
     raw = raw.dropna(subset=["GEOID","dt"]).copy()
@@ -140,11 +158,9 @@ def pass2_merge_side_features(input_path: Path,
                               base_df: pd.DataFrame,
                               side_cols: List[str],
                               batch: int = 12) -> pd.DataFrame:
-    # Numeric ve mevcut olan kolonları partiler halinde işle
-    # Not: event-level ise saatliğe 'mean' ile indiriyoruz.
+    # Şema için hızlı okuma
     if input_path.suffix.lower() == ".parquet":
-        # Parquet'te kolon seçerek partileme: listeleri dilimleyip tekrar tekrar oku
-        cols_present = pd.read_parquet(input_path, columns=None).columns.tolist()  # schema için hızlı okuma
+        cols_present = _safe_read_parquet_columns(input_path, columns=None).columns.tolist()
     else:
         cols_present = pd.read_csv(input_path, nrows=0).columns.tolist()
 
@@ -152,16 +168,13 @@ def pass2_merge_side_features(input_path: Path,
     if not side_cols:
         return base_df
 
-    keep_id = []
-    for c in ["GEOID","geoid","datetime","date","time","event_hour","received_time"]:
-        if c in cols_present: keep_id.append(c)
+    keep_id = [c for c in ["GEOID","geoid","datetime","date","time","event_hour","received_time"] if c in cols_present]
 
-    # partili okuma
     for i in range(0, len(side_cols), batch):
         part = side_cols[i:i+batch]
         cols = list(set(keep_id + part))
         if input_path.suffix.lower() == ".parquet":
-            chunk = pd.read_parquet(input_path, columns=cols)
+            chunk = _safe_read_parquet_columns(input_path, columns=cols)
         else:
             chunk = pd.read_csv(input_path, usecols=[c for c in cols if c in cols_present])
 
@@ -170,7 +183,6 @@ def pass2_merge_side_features(input_path: Path,
         chunk = chunk.dropna(subset=["GEOID","dt"]).copy()
         chunk["dt"] = chunk["dt"].dt.tz_convert("UTC")
 
-        # sadece numeric yan kolonları al
         numerics = [c for c in part if c in chunk.columns]
         if not numerics:
             continue
@@ -184,45 +196,110 @@ def pass2_merge_side_features(input_path: Path,
     return base_df
 
 # -------------------------
+# Risky & Metrics doğrulama / kopyalama / paketleme
+# -------------------------
+def _validate_and_copy_optional(p: Optional[Path], out_dir: Path, tag: str) -> Optional[Path]:
+    if p is None:
+        return None
+    if not p.exists():
+        print(f"[WARN] {tag} bulunamadı: {p}")
+        return None
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dst = out_dir / p.name
+    if p.resolve() != dst.resolve():
+        shutil.copy2(p, dst)
+    print(f"[OK] {tag} kopyalandı → {dst}")
+    return dst
+
+def _sanity_check_risky_hours(p: Path):
+    try:
+        df = pd.read_parquet(p)
+    except Exception:
+        print(f"[WARN] risky_hours okunamadı: {p}")
+        return
+    must_have = {"geoid","hour","risk_score"}
+    if not must_have.issubset(set(map(str.lower, df.columns))):
+        print(f"[WARN] risky_hours şeması beklenenden farklı (geoid/hour/risk_score aranır): {list(df.columns)[:10]}...")
+    else:
+        print(f"[OK] risky_hours şeması uygun görünüyor ({p.name}).")
+
+def _sanity_check_metrics(p: Path):
+    try:
+        df = pd.read_parquet(p)
+    except Exception:
+        print(f"[WARN] metrics dosyası okunamadı: {p}")
+        return
+    maybe_cols = [c for c in ["model","metric","value","fold","timestamp"] if c in df.columns]
+    print(f"[OK] metrics satır: {len(df):,}  kolonlar: {maybe_cols}")
+
+def _package_zip(zip_path: Path, files: List[Path]):
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for f in files:
+            if f and f.exists():
+                z.write(f, arcname=f.name)
+    print(f"[OK] Paket oluşturuldu: {zip_path} (içerik: {[f.name for f in files if f and f.exists()]})")
+
+# -------------------------
 # Ana akış
 # -------------------------
 def run(input_path: Path,
         out_parquet: Path,
-        tz: str | None,
+        tz: Optional[str],
         no_full_grid: bool,
-        side_cols: List[str]):
+        side_cols: List[str],
+        risky_hours_path: Optional[Path],
+        metrics_path: Optional[Path],
+        out_dir: Optional[Path],
+        package_zip: Optional[Path]):
 
-    # Geçiş-1: minimal okuma → cc & Y
+    # 1) Geçiş-1: minimal okuma → cc & Y
     df = pass1_build_cc(input_path, tz=tz)
 
-    # (Opsiyonel) full grid
+    # 2) (Opsiyonel) full grid
     if not no_full_grid:
         grid = _build_full_grid(df[["GEOID","dt","crime_count"]])
         df = grid.merge(df, on=["GEOID","dt"], how="left")
         df["crime_count"] = df["crime_count"].fillna(0).astype("int16")
         df["Y_label"] = df["Y_label"].fillna(0).astype("int8")
-        df = _add_calendar(df, tz=tz)  # grid sonrası tekrar sağlamlaştır
+        df = _add_calendar(df, tz=tz)
 
-    # Geçiş-2: yan özellikler
+    # 3) Geçiş-2: yan özellikler
     if side_cols:
         df = pass2_merge_side_features(input_path, df, side_cols, batch=12)
 
-    # Leakage-safe priors
+    # 4) Leakage-safe priors
     df = _prior_rolling(df, window="90D", suffix="3m")
     df = _prior_rolling(df, window="365D", suffix="12m")
 
-    # Sırala, downcast et ve yaz
+    # 5) Sırala, downcast et ve yaz
     df = df.sort_values(["GEOID","dt"]).reset_index(drop=True)
     df = _downcast_numeric(df)
     out_parquet.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_parquet, index=False)
     print(f"[OK] Yazıldı: {out_parquet}  (satır: {len(df):,}, GEOID: {df['GEOID'].nunique():,})")
 
+    # 6) Risky & Metrics (opsiyonel): doğrula + out_dir'e kopyala
+    packaged_files = [out_parquet]
+    if out_dir:
+        if risky_hours_path:
+            dst_risky = _validate_and_copy_optional(risky_hours_path, out_dir, "risky_hours")
+            if dst_risky:
+                _sanity_check_risky_hours(dst_risky)
+                packaged_files.append(dst_risky)
+        if metrics_path:
+            dst_metrics = _validate_and_copy_optional(metrics_path, out_dir, "metrics")
+            if dst_metrics:
+                _sanity_check_metrics(dst_metrics)
+                packaged_files.append(dst_metrics)
+
+    # 7) Paketleme (opsiyonel)
+    if package_zip:
+        _package_zip(package_zip, packaged_files)
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Y_label + leakage-safe prior (büyük veri için optimize)")
-    p.add_argument("--input", type=Path, required=True,
-                   help="Girdi dosyası (.parquet veya .csv) — ör: fr_crime_10.parquet")
+    p = argparse.ArgumentParser(description="Y_label + leakage-safe priors + (opsiyonel) risky/metrics paketleme")
+    p.add_argument("--input", type=Path, required=True, help="fr_crime_09.parquet (veya CSV)")
     p.add_argument("--out", type=Path, default=Path("sf_crime_grid_full_labeled.parquet"),
                    help="Çıktı Parquet yolu")
     p.add_argument("--tz", type=str, default=None,
@@ -241,8 +318,17 @@ def parse_args():
     ]
     p.add_argument("--side-cols", nargs="*", default=default_side,
                    help="Saatliğe indirgenecek yan özellik kolonları (numeric).")
-    return p.parse_args()
 
+    # Opsiyonel: hazır dosyalar
+    p.add_argument("--risky-hours", type=Path, default=None,
+                   help="Hazır risky_hours.parquet yolu (opsiyonel)")
+    p.add_argument("--metrics", type=Path, default=None,
+                   help="Hazır metrics_stacking_ohe.parquet yolu (opsiyonel)")
+    p.add_argument("--out-dir", type=Path, default=None,
+                   help="Opsiyonel kopyalama klasörü (risky & metrics buraya kopyalanır)")
+    p.add_argument("--package-zip", type=Path, default=None,
+                   help="Hepsini tek ZIP olarak paketle (örn: outputs/fr-crime-outputs-parquet.zip)")
+    return p.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
@@ -252,4 +338,8 @@ if __name__ == "__main__":
         tz=args.tz,
         no_full_grid=args.no_full_grid,
         side_cols=args.side_cols,
+        risky_hours_path=args.risky_hours,
+        metrics_path=args.metrics,
+        out_dir=args.out_dir,
+        package_zip=args.package_zip,
     )
