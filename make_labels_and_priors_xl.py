@@ -222,7 +222,7 @@ def run(input_path: Path,
 def parse_args():
     p = argparse.ArgumentParser(description="Y_label + leakage-safe prior (büyük veri için optimize)")
     p.add_argument("--input", type=Path, required=True,
-                   help="Girdi dosyası (.parquet veya .csv) — ör: fr_crime_11.parquet")
+                   help="Girdi dosyası (.parquet veya .csv) — ör: fr_crime_10.parquet")
     p.add_argument("--out", type=Path, default=Path("sf_crime_grid_full_labeled.parquet"),
                    help="Çıktı Parquet yolu")
     p.add_argument("--tz", type=str, default=None,
