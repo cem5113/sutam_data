@@ -1,0 +1,59 @@
+name: Make Labels and Priors (SUTAM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      persist:
+        description: "Çıktılar nasıl saklansın?"
+        type: choice
+        options: [artifact, commit, none]
+        default: artifact
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  make_labels_and_priors:
+    runs-on: ubuntu-latest
+
+    env:
+      TZ: "America/Los_Angeles"
+      DATA_DIR: sutam_data
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pandas pyarrow numpy
+
+      - name: Generate labels + priors + package
+        run: |
+          python make_labels_and_priors_xl.py \
+            --input      ${{ env.DATA_DIR }}/fr_crime_09.parquet \
+            --out        ${{ env.DATA_DIR }}/sf_crime_grid_full_labeled.parquet \
+            --tz         America/Los_Angeles \
+            --no-full-grid \
+            --risky-hours ${{ env.DATA_DIR }}/risky_hours.parquet \
+            --metrics     ${{ env.DATA_DIR }}/metrics_stacking_ohe.parquet \
+            --out-dir     ${{ env.DATA_DIR }} \
+            --package-zip ${{ env.DATA_DIR }}/fr-crime-outputs-parquet.zip
+
+      - name: Upload artifact (optional)
+        if: ${{ github.event.inputs.persist == 'artifact' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fr-crime-outputs-parquet
+          path: |
+            ${{ env.DATA_DIR }}/sf_crime_grid_full_labeled.parquet
+            ${{ env.DATA_DIR }}/risky_hours.parquet
+            ${{ env.DATA_DIR }}/metrics_stacking_ohe.parquet
+            ${{ env.DATA_DIR }}/fr-crime-outputs-parquet.zip
