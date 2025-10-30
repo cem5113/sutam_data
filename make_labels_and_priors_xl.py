@@ -182,7 +182,9 @@ def _safe_read_parquet_columns(p: Path, columns: Optional[List[str]] = None) -> 
 
     try:
         # Önce direkt dene (hızlı yol)
-        return pd.read_parquet(p, columns=columns)
+        df = pd.read_parquet(p, columns=columns)
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+        return df
     except Exception:
         # Şema üzerinden mevcut kolonları bul ve case-insensitive eşleştir
         try:
