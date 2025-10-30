@@ -107,7 +107,7 @@ def _coerce_tz_aware(s: pd.Series) -> pd.Series:
     return s
 
 def _to_dt(df: pd.DataFrame) -> pd.Series:
-    # saatlik zemin: datetime -> floor('H')
+    # saatlik zemin: datetime -> floor('h')
     s = None
     if "datetime" in df.columns:
         s = pd.to_datetime(df["datetime"], errors="coerce", utc=False)
@@ -122,7 +122,7 @@ def _to_dt(df: pd.DataFrame) -> pd.Series:
     if s.isna().all():
         raise ValueError("Zaman kolonları çözümlenemedi (hepsi NaT).")
     s = _coerce_tz_aware(s).dt.tz_convert("UTC")
-    return s.dt.floor("H")
+    return s.dt.floor("h")
 
 def _add_calendar(df: pd.DataFrame, tz: Optional[str]) -> pd.DataFrame:
     base = "dt"
@@ -137,9 +137,9 @@ def _add_calendar(df: pd.DataFrame, tz: Optional[str]) -> pd.DataFrame:
     return df
 
 def _build_full_grid(df: pd.DataFrame) -> pd.DataFrame:
-    dt_min = df["dt"].min().floor("H")
-    dt_max = df["dt"].max().ceil("H")
-    all_hours = pd.date_range(dt_min, dt_max, freq="H", tz="UTC")
+    dt_min = df["dt"].min().floor("h")
+    dt_max = df["dt"].max().ceil("h")
+    all_hours = pd.date_range(dt_min, dt_max, freq="h", tz="UTC")
     geoids = df["GEOID"].dropna().astype(str).unique()
     grid = (
         pd.MultiIndex.from_product([geoids, all_hours], names=["GEOID","dt"])
@@ -159,7 +159,7 @@ def _prior_rolling(df: pd.DataFrame, window: str, suffix: str,
         g[f"prior_cnt_{suffix}"] = cnt.to_numpy().astype("float32")
         return g.reset_index()
     out = df.groupby(grp_cols, group_keys=False).apply(_roll)
-    hours_in_window = float(pd.Timedelta(window) / pd.Timedelta("1H"))
+    hours_in_window = float(pd.Timedelta(window) / pd.Timedelta("1h"))
     out[f"prior_p_{suffix}"] = (out[f"prior_cnt_{suffix}"] / hours_in_window).astype("float32")
     return out
 
@@ -178,7 +178,9 @@ def _safe_read_parquet_columns(p: Path, columns: Optional[List[str]] = None) -> 
     - Olmayan kolonları sessizce atar (ArrowInvalid hatasını önler)
     """
     if columns is None:
-        return pd.read_parquet(p)
+        df = pd.read_parquet(p)
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+        return df
 
     try:
         # Önce direkt dene (hızlı yol)
@@ -203,7 +205,9 @@ def _safe_read_parquet_columns(p: Path, columns: Optional[List[str]] = None) -> 
                         resolved.append(lower_map[lc])
             # En azından bir kolon olsun; yoksa tamamını oku (minimum şema için)
             if not resolved:
-                return pd.read_parquet(p)
+                df = pd.read_parquet(p)
+                df = df.loc[:, ~df.columns.duplicated()].copy()
+                return df
             seen = set()
             resolved = [c for c in resolved if not (c in seen or seen.add(c))]
             df = pd.read_parquet(p, columns=resolved)
@@ -253,9 +257,14 @@ def pass2_merge_side_features(input_path: Path,
                               base_df: pd.DataFrame,
                               side_cols: List[str],
                               batch: int = 12) -> pd.DataFrame:
-    # Şema için hızlı okuma (parquet'te tüm kolonları alma maliyeti kabul edilebilir)
+    """
+    Girdi dosyasındaki yan değişkenleri saatlik (GEOID×dt) seviyesine indirir
+    ve base_df ile birleştirir.
+    """
+    # Şema için hızlı okuma (Parquet'te sadece kolon adlarını al)
     if input_path.suffix.lower() == ".parquet":
-        cols_present = _safe_read_parquet_columns(input_path, columns=None).columns.tolist()
+        import pyarrow.parquet as pq
+        cols_present = pq.read_schema(input_path).names
     else:
         cols_present = pd.read_csv(input_path, nrows=0).columns.tolist()
 
@@ -412,7 +421,8 @@ def run(input_path: Path,
 # =========================
 def parse_args():
     p = argparse.ArgumentParser(description="Y_label + leakage-safe priors + (opsiyonel) risky/metrics paketleme")
-    p.add_argument("--input", type=Path, required=True, help="fr_crime_09.parquet")
+    p.add_argument("--input", type=Path, required=True,
+                   help="fr_crime_09.parquet / fr_crime_10.parquet (veya CSV)")
     p.add_argument("--out", type=Path, default=Path("sf_crime_grid_full_labeled.parquet"),
                    help="Çıktı Parquet yolu")
     p.add_argument("--tz", type=str, default=None,
