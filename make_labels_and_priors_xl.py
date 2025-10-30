@@ -38,6 +38,11 @@ import pandas as pd
 # =========================
 HERE = Path(__file__).resolve().parent
 
+def resolve_out_path(p: Path) -> Path:
+    """Çıkış yolu: mevcut olmasa da hata verme, CWD'ye göre mutlaklaştır."""
+    p = Path(p)
+    return p if p.is_absolute() else (Path.cwd() / p)
+  
 def resolve_path(p: Path) -> Path:
     """Dosya yolunu sağlamlaştır: mutlak değilse önce CWD, sonra script klasörü."""
     p = Path(p)
@@ -275,7 +280,7 @@ def _sanity_check_metrics(p: Path):
     print(f"[OK] metrics satır: {len(df):,}  kolonlar: {maybe_cols}")
 
 def _package_zip(zip_path: Path, files: List[Path]):
-    zip_path = resolve_path(zip_path) if not zip_path.is_absolute() else zip_path
+    zip_path = resolve_out_path(zip_path)
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for f in files:
