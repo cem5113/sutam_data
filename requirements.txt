@@ -4,6 +4,8 @@ pandas~=2.2
 pyarrow~=16.1
 tqdm~=4.66
 scipy~=1.13
+shap~=0.44
+seaborn~=0.13
 
 # === Makine öğrenmesi / modelleme ===
 scikit-learn~=1.4
