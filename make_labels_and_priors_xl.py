@@ -3,7 +3,7 @@
 
 """
 make_labels_and_priors_xl.py  (REVİZE — FULL GRID ZORUNLU)
-- Girdi: fr_crime_09.parquet / fr_crime_10.parquet (veya CSV)
+- Girdi: fr_crime_09.parquet / fr_crime_09.parquet (veya CSV)
 - Çıktı: sf_crime_grid_full_labeled.parquet (+ opsiyonel paketleme)
 
 Ne yapar?
@@ -15,7 +15,7 @@ Ne yapar?
 
 Kullanım örn:
   python make_labels_and_priors_xl.py \
-    --input fr_crime_10.parquet \
+    --input fr_crime_09.parquet \
     --out outputs/sf_crime_grid_full_labeled.parquet \
     --tz America/Los_Angeles \
     --out-dir outputs \
@@ -402,7 +402,7 @@ def run(input_path: Path,
 def parse_args():
     p = argparse.ArgumentParser(description="Y_label + full grid + leakage-safe priors (+ opsiyonel risky/metrics paketleme)")
     p.add_argument("--input", type=Path, required=True,
-                   help="fr_crime_09.parquet / fr_crime_10.parquet (veya CSV)")
+                   help="fr_crime_09.parquet / fr_crime_09.parquet (veya CSV)")
     p.add_argument("--out", type=Path, default=Path("sf_crime_grid_full_labeled.parquet"),
                    help="Çıktı Parquet yolu")
     p.add_argument("--tz", type=str, default=None,
