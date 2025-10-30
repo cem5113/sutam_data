@@ -298,11 +298,11 @@ def run(input_path: Path,
         package_zip: Optional[Path]):
 
     input_path = resolve_path(input_path)
-    out_parquet = resolve_path(out_parquet) if not out_parquet.is_absolute() else out_parquet
+    out_parquet = resolve_out_path(out_parquet) 
     if out_dir:
-        out_dir = resolve_path(out_dir) if not out_dir.is_absolute() else out_dir
+        out_dir = resolve_out_path(out_dir)         
     if package_zip:
-        package_zip = resolve_path(package_zip) if not package_zip.is_absolute() else package_zip
+        package_zip = resolve_out_path(package_zip)
 
     print(f"[INFO] Girdi: {input_path}")
     print(f"[INFO] Çıktı: {out_parquet}")
