@@ -59,19 +59,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          prefer_09="$(
-            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_09.parquet' -print -quit
+          prefer_10="$(
+            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_10.parquet' -print -quit
           )" || true
           prefer_09="$(
             /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_09.parquet' -print -quit
           )" || true
 
-          if [ -n "${prefer_09}" ]; then
-            INPUT="${prefer_09}"
+          if [ -n "${prefer_10}" ]; then
+            INPUT="${prefer_10}"
           elif [ -n "${prefer_09}" ]; then
             INPUT="${prefer_09}"
           else
-            echo "❌ fr_crime_09.parquet / fr_crime_09.parquet bulunamadı."
+            echo "❌ fr_crime_10.parquet / fr_crime_09.parquet bulunamadı."
             exit 1
           fi
 
@@ -109,13 +109,21 @@ jobs:
           fi
 
           echo "▶️  Running make_labels_and_priors_xl.py ..."
-          python make_labels_and_priors_xl.py \
-            --input      "${INPUT}" \
-            --out        "${OUT_PQ}" \
-            --tz         America/Los_Angeles \
-            --out-dir    "${DATA_DIR}" \
+          python -u make_labels_and_priors_xl.py \
+            --input       "${INPUT}" \
+            --out         "${OUT_PQ}" \
+            --tz          America/Los_Angeles \
+            --out-dir     "${DATA_DIR}" \
             --package-zip "${OUT_ZIP}" \
             "${EXTRA_ARGS[@]}"
+
+          # Çıktılar gerçekten oluştu mu?
+          test -s "${OUT_PQ}" || { echo "❌ Output parquet yok: ${OUT_PQ}"; exit 1; }
+          # İstatistik CSV isteğe bağlıdır; yoksa hata vermesin
+          if [ -f "${DATA_DIR}/y_label_stats.csv" ]; then
+            echo "Y_label stats:"
+            cat "${DATA_DIR}/y_label_stats.csv" || true
+          fi
 
           echo "---- Outputs ----"
           ls -lh "${OUT_PQ}" || true
@@ -129,7 +137,8 @@ jobs:
           path: |
             ${{ env.DATA_DIR }}/${{ env.OUT_FILE }}
             ${{ env.DATA_DIR }}/${{ env.OUT_ZIP }}
-          if-no-files-found: error
+            ${{ env.DATA_DIR }}/y_label_stats.csv
+          if-no-files-found: warn
           retention-days: 14
 
       - name: Commit outputs (if selected)
@@ -141,12 +150,13 @@ jobs:
 
           git add "${DATA_DIR}/${OUT_FILE}" || true
           git add "${DATA_DIR}/${OUT_ZIP}"  || true
+          [ -f "${DATA_DIR}/y_label_stats.csv" ] && git add "${DATA_DIR}/y_label_stats.csv" || true
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
-          git commit -m "chore: add ${OUT_FILE} and ${OUT_ZIP} (auto)"
+          git commit -m "chore: add ${OUT_FILE}, ${OUT_ZIP} and y_label_stats.csv (auto)"
           CURRENT_BRANCH="${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}"
           git push origin "${CURRENT_BRANCH}"
 
@@ -165,4 +175,9 @@ jobs:
             fi
             echo "- Output Parquet: \`${{ env.DATA_DIR }}/${{ env.OUT_FILE }}\`"
             echo "- Output ZIP: \`${{ env.DATA_DIR }}/${{ env.OUT_ZIP }}\`"
+            if [ -f "${{ env.DATA_DIR }}/y_label_stats.csv" ]; then
+              echo ""
+              echo "### Y_label dağılımı"
+              tail -n +1 "${{ env.DATA_DIR }}/y_label_stats.csv"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
