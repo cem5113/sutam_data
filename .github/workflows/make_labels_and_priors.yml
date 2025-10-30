@@ -80,7 +80,7 @@ jobs:
           echo "input=${INPUT}" >> "$GITHUB_OUTPUT"
 
           RH="$(
-            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'risky_hours.parquet' -print -quit
+            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f \( -name 'risk_hourly.parquet' -o -name 'risky_hours.parquet' \) -print -quit
           )" || true
           MET="$(
             /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'metrics_stacking_ohe.parquet' -print -quit
