@@ -3,15 +3,15 @@
 
 """
 make_labels_and_priors_xl.py  (REVİZE — FULL GRID ZORUNLU)
-- Girdi: fr_crime_09.parquet / fr_crime_09.parquet (veya CSV)
+- Girdi: fr_crime_09.parquet / CSV (event-level veya aggregate)
 - Çıktı: sf_crime_grid_full_labeled.parquet (+ opsiyonel paketleme)
 
 Ne yapar?
-  1) GEOID×saat bazında crime_count ve Y_label üretir (event-level ise sayar; crime_count varsa toplar)
-  2) Tüm zaman aralığı için GEOID×saat tam grid kurar → Y_label=0 olan saatler de dahil
+  1) GEOID×saat bazında crime_count ve Y_label üretir
+  2) Tüm zaman aralığı için GEOID×saat tam grid kurar → Y_label=0 saatler de dahil
   3) Leakage-safe rolling priors (3m/12m): (GEOID, day_of_week, hour, season) kırılımında geçmişe bakar
-  4) İstenirse hazır risky_hours.parquet ve metrics_stacking_ohe.parquet dosyalarını doğrular, out_dir'e kopyalar
-  5) İstenirse hepsini tek ZIP içinde paketler (artifact)
+  4) (Ops.) risky_hours.parquet ve metrics_stacking_ohe.parquet doğrulayıp out_dir'e kopyalar
+  5) (Ops.) Hepsini ZIP'e paketler
 
 Kullanım örn:
   python make_labels_and_priors_xl.py \
@@ -42,7 +42,7 @@ def resolve_out_path(p: Path) -> Path:
     return p if p.is_absolute() else (Path.cwd() / p)
 
 def resolve_path(p: Path) -> Path:
-    """Dosya yolunu sağlamlaştır: mutlak değilse önce CWD, sonra script klasörü."""
+    """Girdi yolu: mutlak değilse önce CWD, sonra script klasörü."""
     p = Path(p)
     if p.is_absolute():
         return p
@@ -88,6 +88,7 @@ def _norm_geoid(df: pd.DataFrame) -> pd.DataFrame:
         df = df.drop(columns=["geoid"])
     else:
         raise ValueError("GEOID/geoid kolonu bulunamadı.")
+    # Çift kolonları tekilleştir
     df = df.loc[:, ~df.columns.duplicated()].copy()
     return df
 
@@ -165,18 +166,16 @@ def _downcast_numeric(df: pd.DataFrame, prefer_float32=True) -> pd.DataFrame:
 def _safe_read_parquet_columns(p: Path, columns: Optional[List[str]] = None) -> pd.DataFrame:
     """
     Parquet okurken istenen kolonların dosyada olup olmadığını kontrol eder.
-    - Case-insensitive eşleştirme yapar (örn. 'geoid' -> 'GEOID')
-    - Olmayan kolonları sessizce atar (ArrowInvalid hatasını önler)
+    - Case-insensitive eşleştirme (örn. 'geoid' -> 'GEOID')
+    - Olmayan kolonları sessizce atar
     - Okuma sonrası çift kolonları tekilleştirir
     """
     if columns is None:
         df = pd.read_parquet(p)
-        df = df.loc[:, ~df.columns.duplicated()].copy()
-        return df
+        return df.loc[:, ~df.columns.duplicated()].copy()
     try:
         df = pd.read_parquet(p, columns=columns)
-        df = df.loc[:, ~df.columns.duplicated()].copy()
-        return df
+        return df.loc[:, ~df.columns.duplicated()].copy()
     except Exception:
         try:
             import pyarrow.parquet as pq
@@ -193,17 +192,14 @@ def _safe_read_parquet_columns(p: Path, columns: Optional[List[str]] = None) -> 
                         resolved.append(lower_map[lc])
             if not resolved:
                 df = pd.read_parquet(p)
-                df = df.loc[:, ~df.columns.duplicated()].copy()
-                return df
+                return df.loc[:, ~df.columns.duplicated()].copy()
             seen = set()
             resolved = [c for c in resolved if not (c in seen or seen.add(c))]
             df = pd.read_parquet(p, columns=resolved)
-            df = df.loc[:, ~df.columns.duplicated()].copy()
-            return df
+            return df.loc[:, ~df.columns.duplicated()].copy()
         except Exception:
             df = pd.read_parquet(p)
-            df = df.loc[:, ~df.columns.duplicated()].copy()
-            return df
+            return df.loc[:, ~df.columns.duplicated()].copy()
 
 # =========================
 # Geçiş-1: minimal okuma (crime_count & Y_label)
@@ -211,14 +207,13 @@ def _safe_read_parquet_columns(p: Path, columns: Optional[List[str]] = None) -> 
 def pass1_build_cc(input_path: Path, tz: Optional[str]) -> pd.DataFrame:
     minimal_cols = ["GEOID","geoid","datetime","date","time","event_hour","received_time","crime_count"]
     if input_path.suffix.lower() == ".parquet":
-        raw = _safe_read_parquet_columns(input_path, columns=[c for c in minimal_cols if c])
+        raw = _safe_read_parquet_columns(input_path, columns=minimal_cols)
     else:
         header = pd.read_csv(input_path, nrows=0).columns.tolist()
         usecols = [c for c in minimal_cols if c in header]
         raw = pd.read_csv(input_path, usecols=usecols)
 
     raw = _norm_geoid(raw)
-    raw = raw.loc[:, ~raw.columns.duplicated()].copy()
     raw["dt"] = _to_dt(raw)
     raw = raw.dropna(subset=["GEOID","dt"]).copy()
 
@@ -378,7 +373,35 @@ def run(input_path: Path,
     df.to_parquet(out_parquet, index=False)
     print(f"[OK] Yazıldı: {out_parquet}  (satır: {len(df):,}, GEOID: {df['GEOID'].nunique():,})")
 
-    # 6) Risky & Metrics (opsiyonel): doğrula + out_dir'e kopyala
+    # --- Y_label dağılımı (global) ---
+    y_counts = df["Y_label"].value_counts(dropna=False).reindex([1, 0], fill_value=0)
+    total = int(y_counts.sum())
+    y1 = int(y_counts.get(1, 0))
+    y0 = int(y_counts.get(0, 0))
+    p1 = (y1 / total * 100.0) if total else 0.0
+    p0 = (y0 / total * 100.0) if total else 0.0
+    
+    print(f"[STATS] Y_label=1: {y1:,} ({p1:.2f}%) | Y_label=0: {y0:,} ({p0:.2f}%) | Toplam: {total:,}")
+    
+    # CSV olarak da kaydet (çıktı dosyasıyla aynı klasöre)
+    stats_df = pd.DataFrame(
+        {"Y_label": [1, 0], "Count": [y1, y0], "Percent(%)": [round(p1, 4), round(p0, 4)]}
+    )
+    stats_csv_path = out_parquet.with_name("y_label_stats.csv")
+    stats_df.to_csv(stats_csv_path, index=False)
+    print(f"[OK] Y_label dağılımı yazıldı → {stats_csv_path}")
+    
+    # GitHub Actions özetine yaz (varsa)
+    import os
+    gh_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if gh_summary:
+        with open(gh_summary, "a", encoding="utf-8") as f:
+            f.write("\n### Y_label dağılımı\n\n")
+            f.write(f"- Y=1: **{y1:,}** (%{p1:.2f})\n")
+            f.write(f"- Y=0: **{y0:,}** (%{p0:.2f})\n")
+            f.write(f"- Toplam: **{total:,}** satır\n")
+
+    # 6) Risky & Metrics (opsiyonel)
     packaged_files: List[Path] = [out_parquet]
     if out_dir:
         if risky_hours_path:
@@ -400,9 +423,9 @@ def run(input_path: Path,
 # CLI
 # =========================
 def parse_args():
-    p = argparse.ArgumentParser(description="Y_label + full grid + leakage-safe priors (+ opsiyonel risky/metrics paketleme)")
+    p = argparse.ArgumentParser(description="Y_label + FULL GRID + leakage-safe priors (+ opsiyonel paketleme)")
     p.add_argument("--input", type=Path, required=True,
-                   help="fr_crime_09.parquet / fr_crime_09.parquet (veya CSV)")
+                   help="fr_crime_09.parquet (veya CSV)")
     p.add_argument("--out", type=Path, default=Path("sf_crime_grid_full_labeled.parquet"),
                    help="Çıktı Parquet yolu")
     p.add_argument("--tz", type=str, default=None,
