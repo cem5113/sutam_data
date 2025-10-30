@@ -9,7 +9,7 @@ scipy~=1.13
 scikit-learn~=1.4
 xgboost~=2.1
 lightgbm~=4.3
-imbalanced-learn~=0.12   # ← SMOTE/SMOTENC için eklendi
+imbalanced-learn~=0.12  
 
 # === (Opsiyonel) Model kaydetme ve raporlama ===
 joblib~=1.4
