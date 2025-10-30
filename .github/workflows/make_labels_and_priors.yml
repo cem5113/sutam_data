@@ -62,7 +62,6 @@ jobs:
           prefer_10="$(
             /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_10.parquet' -print -quit
           )" || true
-
           prefer_09="$(
             /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_09.parquet' -print -quit
           )" || true
@@ -114,8 +113,7 @@ jobs:
             --input      "${INPUT}" \
             --out        "${OUT_PQ}" \
             --tz         America/Los_Angeles \
-            --no-full-grid \
-            --out-dir     "${DATA_DIR}" \
+            --out-dir    "${DATA_DIR}" \
             --package-zip "${OUT_ZIP}" \
             "${EXTRA_ARGS[@]}"
 
@@ -148,7 +146,6 @@ jobs:
             echo "No changes to commit."
             exit 0
           fi
-          # Mevcut branch'a pushla
           git commit -m "chore: add ${OUT_FILE} and ${OUT_ZIP} (auto)"
           CURRENT_BRANCH="${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}"
           git push origin "${CURRENT_BRANCH}"
