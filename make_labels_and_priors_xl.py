@@ -81,12 +81,23 @@ def _season_from_month(m: int) -> str:
     return "fall"
 
 def _norm_geoid(df: pd.DataFrame) -> pd.DataFrame:
-    if "GEOID" in df.columns:
+    cols = list(df.columns)
+    has_up = "GEOID" in cols
+    has_low = "geoid" in cols
+
+    if has_up and has_low:
+        # Önce üstteki ana kolonu standardize et, sonra alttakini düşür
         df["GEOID"] = df["GEOID"].astype(str)
-    elif "geoid" in df.columns:
+        df = df.drop(columns=["geoid"])
+    elif has_up:
+        df["GEOID"] = df["GEOID"].astype(str)
+    elif has_low:
         df["GEOID"] = df["geoid"].astype(str)
+        df = df.drop(columns=["geoid"])
     else:
         raise ValueError("GEOID/geoid kolonu bulunamadı.")
+
+    df = df.loc[:, ~df.columns.duplicated()].copy()
     return df
 
 def _coerce_tz_aware(s: pd.Series) -> pd.Series:
@@ -191,7 +202,11 @@ def _safe_read_parquet_columns(p: Path, columns: Optional[List[str]] = None) -> 
             # En azından bir kolon olsun; yoksa tamamını oku (minimum şema için)
             if not resolved:
                 return pd.read_parquet(p)
-            return pd.read_parquet(p, columns=resolved)
+            seen = set()
+            resolved = [c for c in resolved if not (c in seen or seen.add(c))]
+            df = pd.read_parquet(p, columns=resolved)
+            df = df.loc[:, ~df.columns.duplicated()].copy()
+            return df
         except Exception:
             # Son çare: tamamını oku
             return pd.read_parquet(p)
@@ -210,6 +225,7 @@ def pass1_build_cc(input_path: Path, tz: Optional[str]) -> pd.DataFrame:
         raw = pd.read_csv(input_path, usecols=usecols)
 
     raw = _norm_geoid(raw)
+    raw = raw.loc[:, ~raw.columns.duplicated()].copy()
     raw["dt"] = _to_dt(raw)
     raw = raw.dropna(subset=["GEOID","dt"]).copy()
 
