@@ -1,5 +1,15 @@
+# === Temel veri işleme ===
 pandas
-pyarrow
 numpy
+pyarrow
 tqdm
 scipy
+
+# === Makine öğrenmesi / modelleme ===
+scikit-learn
+xgboost
+lightgbm
+
+# === (Opsiyonel) Model kaydetme ve raporlama ===
+joblib
+matplotlib
