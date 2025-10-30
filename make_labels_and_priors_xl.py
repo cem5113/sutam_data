@@ -161,8 +161,40 @@ def _downcast_numeric(df: pd.DataFrame, prefer_float32=True) -> pd.DataFrame:
     return df
 
 def _safe_read_parquet_columns(p: Path, columns: Optional[List[str]] = None) -> pd.DataFrame:
-    # Tek noktadan okuma; pyarrow varsayılanı yeterli
-    return pd.read_parquet(p, columns=columns)
+    """
+    Parquet okurken istenen kolonların dosyada olup olmadığını kontrol eder.
+    - Case-insensitive eşleştirme yapar (örn. 'geoid' -> 'GEOID')
+    - Olmayan kolonları sessizce atar (ArrowInvalid hatasını önler)
+    """
+    if columns is None:
+        return pd.read_parquet(p)
+
+    try:
+        # Önce direkt dene (hızlı yol)
+        return pd.read_parquet(p, columns=columns)
+    except Exception:
+        # Şema üzerinden mevcut kolonları bul ve case-insensitive eşleştir
+        try:
+            import pyarrow.parquet as pq
+            schema = pq.read_schema(p)
+            actual_names = list(schema.names)
+            lower_map = {name.lower(): name for name in actual_names}
+
+            resolved = []
+            for c in columns:
+                if c in actual_names:
+                    resolved.append(c)
+                else:
+                    lc = c.lower()
+                    if lc in lower_map:
+                        resolved.append(lower_map[lc])
+            # En azından bir kolon olsun; yoksa tamamını oku (minimum şema için)
+            if not resolved:
+                return pd.read_parquet(p)
+            return pd.read_parquet(p, columns=resolved)
+        except Exception:
+            # Son çare: tamamını oku
+            return pd.read_parquet(p)
 
 
 # =========================
