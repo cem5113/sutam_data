@@ -1,4 +1,4 @@
-name: Make Labels and Priors (SUTAM)
+name: Make Labels + Train (SUTAM)
 
 on:
   workflow_dispatch:
@@ -14,9 +14,8 @@ permissions:
   actions: read
 
 jobs:
-  make_labels_and_priors:
+  build_and_train:
     runs-on: ubuntu-latest
-
     env:
       TZ: "America/Los_Angeles"
       DATA_DIR: .
@@ -29,13 +28,10 @@ jobs:
         with:
           lfs: true
 
-      - name: Show workspace (quick diag)
+      - name: Show workspace
         run: |
-          set -e
           echo "PWD=$(pwd)"
           ls -lah
-          echo "---- Top-level files ----"
-          /usr/bin/find . -maxdepth 1 -type f -printf "%p\t%k KB\n" | sort || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -46,12 +42,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          set -e
           python -m pip install -U pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install pandas pyarrow numpy
+            pip install pandas pyarrow numpy scikit-learn xgboost lightgbm
           fi
 
       - name: Detect input parquet & optional files
@@ -93,7 +88,7 @@ jobs:
           echo "RISKY: ${RH:-<none>}"
           echo "METRICS: ${MET:-<none>}"
 
-      - name: Generate labels + priors + package
+      - name: Build labels + priors (+ package)
         run: |
           set -euo pipefail
           INPUT="${{ steps.detect.outputs.input }}"
@@ -117,23 +112,23 @@ jobs:
             --package-zip "${OUT_ZIP}" \
             "${EXTRA_ARGS[@]}"
 
-          # Çıktılar gerçekten oluştu mu?
           test -s "${OUT_PQ}" || { echo "❌ Output parquet yok: ${OUT_PQ}"; exit 1; }
-          # İstatistik CSV isteğe bağlıdır; yoksa hata vermesin
-          if [ -f "${DATA_DIR}/y_label_stats.csv" ]; then
-            echo "Y_label stats:"
-            cat "${DATA_DIR}/y_label_stats.csv" || true
-          fi
+          [ -f "${DATA_DIR}/y_label_stats.csv" ] && { echo "Y_label stats:"; cat "${DATA_DIR}/y_label_stats.csv" || true; }
 
           echo "---- Outputs ----"
           ls -lh "${OUT_PQ}" || true
           ls -lh "${OUT_ZIP}" || true
 
-      - name: Upload artifact (if selected)
+      - name: Train hourly model
+        run: |
+          set -euo pipefail
+          python train_hourly_model.py
+
+      - name: Upload artifacts (if selected)
         if: ${{ github.event.inputs.persist == 'artifact' }}
         uses: actions/upload-artifact@v4
         with:
-          name: fr-crime-outputs-parquet
+          name: sutam-hourly-output
           path: |
             ${{ env.DATA_DIR }}/${{ env.OUT_FILE }}
             ${{ env.DATA_DIR }}/${{ env.OUT_ZIP }}
@@ -147,24 +142,21 @@ jobs:
           set -e
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
           git add "${DATA_DIR}/${OUT_FILE}" || true
           git add "${DATA_DIR}/${OUT_ZIP}"  || true
           [ -f "${DATA_DIR}/y_label_stats.csv" ] && git add "${DATA_DIR}/y_label_stats.csv" || true
-
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
-          git commit -m "chore: add ${OUT_FILE}, ${OUT_ZIP} and y_label_stats.csv (auto)"
-          CURRENT_BRANCH="${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}"
-          git push origin "${CURRENT_BRANCH}"
+          git commit -m "chore: add ${OUT_FILE}, ${OUT_ZIP} and y_label_stats.csv + training outputs"
+          git push origin "${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}"
 
       - name: Job summary
         run: |
           set -e
           {
-            echo "## Make Labels and Priors — Özet"
+            echo "## Make Labels + Train — Özet"
             echo ""
             echo "- Input: \`${{ steps.detect.outputs.input }}\`"
             if [ -n "${{ steps.detect.outputs.risky_hours }}" ]; then
