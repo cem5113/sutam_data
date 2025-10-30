@@ -59,19 +59,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          prefer_10="$(
-            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_10.parquet' -print -quit
+          prefer_09="$(
+            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_09.parquet' -print -quit
           )" || true
           prefer_09="$(
             /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_09.parquet' -print -quit
           )" || true
 
-          if [ -n "${prefer_10}" ]; then
-            INPUT="${prefer_10}"
+          if [ -n "${prefer_09}" ]; then
+            INPUT="${prefer_09}"
           elif [ -n "${prefer_09}" ]; then
             INPUT="${prefer_09}"
           else
-            echo "❌ fr_crime_10.parquet / fr_crime_09.parquet bulunamadı."
+            echo "❌ fr_crime_09.parquet / fr_crime_09.parquet bulunamadı."
             exit 1
           fi
 
