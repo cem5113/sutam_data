@@ -46,6 +46,8 @@ def add_calendar_cols(df: pd.DataFrame, t0_local_col: str) -> pd.DataFrame:
     df["hour_start"]  = df[t0_local_col].dt.hour.astype("int8")
     return df
 
+# ... dosyanın üst kısmı aynen ...
+
 def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: List[str]) -> pd.DataFrame:
     df = df.sort_values(["GEOID", "t0"]).copy()
     keys = [k for k in keys if k in df.columns]
@@ -72,73 +74,88 @@ def main():
     if not src.exists():
         raise SystemExit(f"Girdi yok: {src.resolve()}")
 
+    # --- 1) Oku + şemayı doğrula
     df = pd.read_parquet(src)
     need = {"dt", "GEOID"}
     miss = need - set(df.columns)
     if miss:
         raise SystemExit(f"Eksik kolon(lar): {miss}")
 
+    # Eski yardımcı kolonu at
     drop_candidates = [c for c in CAL_DROP if c in df.columns]
     if drop_candidates:
         df = df.drop(columns=drop_candidates)
 
+    # --- 2) Zaman hazırlığı (UTC→opsiyonel yerel)
     df["dt"] = pd.to_datetime(df["dt"], utc=True)
     dt_local = to_local(df["dt"], args.tz)
     t0_local, block_id = make_t0_and_block(dt_local, freq)
 
+    # --- 3) Toplama için hazırlık
     sdf = df.copy()
     sdf["t0_local"] = t0_local
     if block_id is not None:
         sdf["block_id"] = block_id
 
+    # Numerikler: crime_count SUM, diğerleri MEAN
     base_exclude = {"GEOID", "dt", "Y_label"}
-    num_cols = [c for c in sdf.columns if c not in base_exclude and pd.api.types.is_numeric_dtype(sdf[c])]
+    num_cols = [c for c in sdf.columns
+                if c not in base_exclude and pd.api.types.is_numeric_dtype(sdf[c])]
 
     agg_map = {}
     if "crime_count" in sdf.columns:
         agg_map["crime_count"] = "sum"
     other_nums = [c for c in num_cols if c != "crime_count"]
-    agg_map |= {c: "mean" for c in other_nums}
+    agg_map.update({c: "mean" for c in other_nums})
 
     group_keys = ["GEOID", "t0_local"] + (["block_id"] if "block_id" in sdf.columns else [])
     agg = sdf.groupby(group_keys, as_index=False).agg(agg_map)
 
+    # --- 4) Pencere etiketi (≥1 olay?)
     if "crime_count" not in agg.columns:
         raise SystemExit("crime_count kolonu bekleniyordu.")
     agg["Y_label"] = (agg["crime_count"] > 0).astype("int8")
 
-    # ── FIX: t0_local zaten tz-aware → sadece tz_convert("UTC") yap
-    # (tz-aware olmayan nadir durumda güvenli yerelleştirme)
+    # --- 5) t0 (UTC) üret (t0_local tz-aware olduğundan sadece tz_convert)
     t0_loc = pd.to_datetime(agg["t0_local"], errors="coerce")
     if getattr(t0_loc.dt, "tz", None) is None:
         agg["t0"] = t0_loc.dt.tz_localize(args.tz or "UTC").dt.tz_convert("UTC")
     else:
         agg["t0"] = t0_loc.dt.tz_convert("UTC")
 
+    # --- 6) Takvim kolonları (yerel t0 üzerinden)
     agg = add_calendar_cols(agg, "t0_local")
-    agg["day_of_week"] = agg["day_of_week"].astype("int8")
-    if "block_id" in agg.columns:
-        agg["block_id"] = agg["block_id"].astype("int8")
 
-    season_keys = ["day_of_week"] + (["block_id"] if "block_id" in agg.columns else [])
-
-    keep_cols = ["GEOID", "t0", "t0_local", "Y_label", "crime_count", "year", "month", "day_of_week"]
+    # --- 7) Çıktıda tutulacaklar
+    keep_cols = ["GEOID", "t0", "t0_local", "Y_label", "crime_count",
+                 "year", "month", "day_of_week"]
     if "block_id" in agg.columns:
         keep_cols.append("block_id")
     keep_cols += other_nums
     keep_cols = [c for c in keep_cols if c in agg.columns]
     agg = agg[keep_cols].copy()
 
+    # --- 8) Güvenlik bloğu: kopya başlıkları at + anahtar tipleri sabitle
+    agg = agg.loc[:, ~agg.columns.duplicated()]
+    for col in ("day_of_week", "block_id"):
+        if col in agg.columns:
+            agg[col] = pd.to_numeric(agg[col], errors="coerce").fillna(-1).astype("int8")
+
+    # --- 9) Priors (mevsimsellik anahtarları: DOW (+block_id))
+    season_keys = ["day_of_week"] + (["block_id"] if "block_id" in agg.columns else [])
     agg = prior_rolling(agg, window="28D",  suffix="28d",  keys=season_keys)
     agg = prior_rolling(agg, window="180D", suffix="180d", keys=season_keys)
 
+    # --- 10) Sırala + t0_local'ı düşür + yaz
     order_cols = ["GEOID", "t0"] + (["block_id"] if "block_id" in agg.columns else [])
     agg = agg.sort_values(order_cols).reset_index(drop=True)
-    agg = agg.drop(columns=["t0_local"])
+    if "t0_local" in agg.columns:
+        agg = agg.drop(columns=["t0_local"])
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     agg.to_parquet(dst, index=False)
 
+    # --- 11) Bilgi
     y_rate = float(agg["Y_label"].mean())
     print(f"[OK] Yazıldı: {dst}  satır={len(agg):,}  GEOID={agg['GEOID'].nunique():,}")
     print(f"[INFO] Y_label(1) % ≈ {100*y_rate:.4f} | 0 % ≈ {100*(1-y_rate):.4f}")
