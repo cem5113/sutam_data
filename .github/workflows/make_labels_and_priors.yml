@@ -8,6 +8,15 @@ on:
         type: choice
         options: [artifact, commit, none]
         default: artifact
+      granularity:
+        description: "Hangi model(ler) eğitilsin?"
+        type: choice
+        options: [hourly, 8h, 1d, all]
+        default: hourly
+      balanced:
+        description: "Saatlik modeli SMOTE/downsample ile dengele"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -46,7 +55,10 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install pandas pyarrow numpy scikit-learn xgboost lightgbm
+            # Minimal ama blok/smote için de yeterli
+            pip install numpy pandas pyarrow tqdm scipy \
+                        scikit-learn xgboost lightgbm imbalanced-learn \
+                        joblib matplotlib
           fi
 
       - name: Detect input parquet & optional files
@@ -70,8 +82,8 @@ jobs:
             exit 1
           fi
 
-          echo "✅ INPUT=${INPUT}"
           echo "input=${INPUT}" >> "$GITHUB_OUTPUT"
+          echo "✅ INPUT=${INPUT}"
 
           RH="$(
             /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f \( -name 'risk_hourly.parquet' -o -name 'risky_hours.parquet' \) -print -quit
@@ -119,20 +131,80 @@ jobs:
           ls -lh "${OUT_PQ}" || true
           ls -lh "${OUT_ZIP}" || true
 
-      - name: Train hourly model
+      # ---- 8H / 1D için agregasyon
+      - name: Aggregate to 8H and/or 1D
+        if: ${{ github.event.inputs.granularity == '8h' || github.event.inputs.granularity == '1d' || github.event.inputs.granularity == 'all' }}
         run: |
           set -euo pipefail
-          python train_hourly_model.py
+          MAKE_8H=false
+          MAKE_1D=false
+          if [ "${{ github.event.inputs.granularity }}" = "8h" ] || [ "${{ github.event.inputs.granularity }}" = "all" ]; then
+            MAKE_8H=true
+          fi
+          if [ "${{ github.event.inputs.granularity }}" = "1d" ] || [ "${{ github.event.inputs.granularity }}" = "all" ]; then
+            MAKE_1D=true
+          fi
+
+          ARGS=()
+          $MAKE_8H && ARGS+=( --make-8h )
+          $MAKE_1D && ARGS+=( --make-1d )
+
+          echo "▶️  aggregate_windows.py ${ARGS[*]}"
+          python -u aggregate_windows.py "${ARGS[@]}"
+
+          ls -lh sf_crime_grid_8h.parquet || true
+          ls -lh sf_crime_grid_1d.parquet || true
+
+      # ---- Saatlik eğitim: balanced seçimine göre script
+      - name: Train hourly model (balanced or vanilla)
+        if: ${{ github.event.inputs.granularity == 'hourly' || github.event.inputs.granularity == 'all' }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.balanced }}" = "true" ]; then
+            echo "▶️  train_hourly_model_balanced.py"
+            python -u train_hourly_model_balanced.py
+          else
+            echo "▶️  train_hourly_model.py"
+            python -u train_hourly_model.py
+          fi
+
+      # ---- 8H eğitim
+      - name: Train 8H model
+        if: ${{ github.event.inputs.granularity == '8h' || github.event.inputs.granularity == 'all' }}
+        run: |
+          set -euo pipefail
+          echo "▶️  train_block_model.py (8H)"
+          python -u train_block_model.py  # default 8H dosyasını okuyor (sf_crime_grid_8h.parquet)
+
+      # ---- 1D eğitim
+      - name: Train 1D model
+        if: ${{ github.event.inputs.granularity == '1d' || github.event.inputs.granularity == 'all' }}
+        run: |
+          set -euo pipefail
+          echo "▶️  train_block_model.py (1D)"
+          # train_block_model.py içinde DATA_PATH'i CLI argümanına çevirmediysen
+          # küçük bir hack: dosyayı kopyalayıp isim verelim:
+          cp sf_crime_grid_1d.parquet sf_crime_grid_8h.parquet
+          python -u train_block_model.py
+          # ardından geri al:
+          git checkout -- sf_crime_grid_8h.parquet || true
 
       - name: Upload artifacts (if selected)
         if: ${{ github.event.inputs.persist == 'artifact' }}
         uses: actions/upload-artifact@v4
         with:
-          name: sutam-hourly-output
+          name: sutam-model-outputs
           path: |
             ${{ env.DATA_DIR }}/${{ env.OUT_FILE }}
             ${{ env.DATA_DIR }}/${{ env.OUT_ZIP }}
             ${{ env.DATA_DIR }}/y_label_stats.csv
+            # Agregasyon çıktıları (varsa)
+            sf_crime_grid_8h.parquet
+            sf_crime_grid_1d.parquet
+            # Modeller & raporlar
+            models/*.joblib
+            reports/*.json
+            reports/*.csv
           if-no-files-found: warn
           retention-days: 14
 
@@ -145,11 +217,16 @@ jobs:
           git add "${DATA_DIR}/${OUT_FILE}" || true
           git add "${DATA_DIR}/${OUT_ZIP}"  || true
           [ -f "${DATA_DIR}/y_label_stats.csv" ] && git add "${DATA_DIR}/y_label_stats.csv" || true
+          [ -f sf_crime_grid_8h.parquet ] && git add sf_crime_grid_8h.parquet || true
+          [ -f sf_crime_grid_1d.parquet ] && git add sf_crime_grid_1d.parquet || true
+          git add models/*.joblib 2>/dev/null || true
+          git add reports/* 2>/dev/null || true
+
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
-          git commit -m "chore: add ${OUT_FILE}, ${OUT_ZIP} and y_label_stats.csv + training outputs"
+          git commit -m "chore: labels+priors, (hourly/8h/1d) training & reports"
           git push origin "${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}"
 
       - name: Job summary
@@ -159,6 +236,8 @@ jobs:
             echo "## Make Labels + Train — Özet"
             echo ""
             echo "- Input: \`${{ steps.detect.outputs.input }}\`"
+            echo "- Granularity: \`${{ github.event.inputs.granularity }}\`"
+            echo "- Balanced(hourly): \`${{ github.event.inputs.balanced }}\`"
             if [ -n "${{ steps.detect.outputs.risky_hours }}" ]; then
               echo "- risky_hours: \`${{ steps.detect.outputs.risky_hours }}\`"
             fi
@@ -172,4 +251,7 @@ jobs:
               echo "### Y_label dağılımı"
               tail -n +1 "${{ env.DATA_DIR }}/y_label_stats.csv"
             fi
+            echo ""
+            ls -lh models 2>/dev/null || true
+            ls -lh reports 2>/dev/null || true
           } >> "$GITHUB_STEP_SUMMARY"
