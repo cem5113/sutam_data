@@ -57,6 +57,7 @@ def make_t0_and_block(dt_local: pd.Series, freq: str) -> Tuple[pd.Series, Option
 
 def add_calendar_cols(df: pd.DataFrame, t0_local_col: str) -> pd.DataFrame:
     """Takvim kolonları (yerel t0 üzerinden)."""
+    # Tekil ve tipleri net kolonlar yaz
     df["year"]        = df[t0_local_col].dt.year.astype("int16")
     df["month"]       = df[t0_local_col].dt.month.astype("int8")
     df["day_of_week"] = df[t0_local_col].dt.dayofweek.astype("int8")
@@ -70,7 +71,11 @@ def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: List[str]) -
     """
     df = df.sort_values(["GEOID", "t0"]).copy()
 
-    grp_cols = ["GEOID"] + [k for k in keys if k in df.columns]
+    # Güvenlik: keys gerçekten tekil 1-D kolonlar olsun
+    for k in list(keys):
+        if k not in df.columns:
+            keys.remove(k)
+    grp_cols = ["GEOID"] + keys
 
     def _roll(g: pd.DataFrame) -> pd.DataFrame:
         g = g.sort_values("t0").set_index("t0")
@@ -108,7 +113,7 @@ def main():
     if drop_candidates:
         df = df.drop(columns=drop_candidates)
 
-    # Zaman hazırlığı
+    # Zaman hazırlığı — yerel referans üret
     df["dt"] = pd.to_datetime(df["dt"], utc=True)
     dt_local = to_local(df["dt"], args.tz)
     t0_local, block_id = make_t0_and_block(dt_local, freq)
@@ -130,7 +135,6 @@ def main():
     agg_map |= {c: "mean" for c in other_nums}
 
     group_keys = ["GEOID", "t0_local"] + (["block_id"] if "block_id" in sdf.columns else [])
-
     agg = sdf.groupby(group_keys, as_index=False).agg(agg_map)
 
     # Y_label: pencerede >=1 olay?
@@ -139,31 +143,41 @@ def main():
     agg["Y_label"] = (agg["crime_count"] > 0).astype("int8")
 
     # t0 (UTC) ve takvim kolonları
-    agg["t0"] = pd.to_datetime(agg["t0_local"]).dt.tz_localize(None).dt.tz_localize(args.tz or "UTC").dt.tz_convert("UTC")
+    # t0_local tz-aware → UTC'ye çevir ve t0 (UTC) olarak yaz
+    if args.tz:
+        agg["t0"] = pd.to_datetime(agg["t0_local"]).dt.tz_localize(args.tz).dt.tz_convert("UTC")
+    else:
+        # t0_local zaten UTC ise (to_local UTC iade etmişti) yine UTC'ye normalize et
+        agg["t0"] = pd.to_datetime(agg["t0_local"], utc=True).dt.tz_convert("UTC")
+
+    # Takvim kolonlarını (yerel) tekil 1-D olarak yeniden kur
     agg = add_calendar_cols(agg, "t0_local")
+    agg["day_of_week"] = agg["day_of_week"].astype("int8")
+    if "block_id" in agg.columns:
+        agg["block_id"] = agg["block_id"].astype("int8")
 
     # Priors (28g ve 180g), mevsimsellik anahtarları
     season_keys = ["day_of_week"]
     if "block_id" in agg.columns:
         season_keys.append("block_id")
 
-    # Sadece gerekli kolonlar + priors
-    keep_cols = ["GEOID", "t0", "Y_label", "crime_count", "year", "month", "day_of_week"]
+    # Minimal kolon setini oluştur (dupe/çok boyutlu kolon kalmasın)
+    keep_cols = ["GEOID", "t0", "t0_local", "Y_label", "crime_count", "year", "month", "day_of_week"]
     if "block_id" in agg.columns:
         keep_cols.append("block_id")
-    # Ortalama alınan numerikleri de koru
     keep_cols += other_nums
     keep_cols = [c for c in keep_cols if c in agg.columns]
-
     agg = agg[keep_cols].copy()
 
     # Priors ekle
     agg = prior_rolling(agg, window="28D",  suffix="28d",  keys=season_keys)
     agg = prior_rolling(agg, window="180D", suffix="180d", keys=season_keys)
 
-    # Sıralama + yazma
+    # Sıralama + yazma (çıktıda t0 UTC, t0_local yok)
     order_cols = ["GEOID", "t0"] + (["block_id"] if "block_id" in agg.columns else [])
     agg = agg.sort_values(order_cols).reset_index(drop=True)
+    if "t0_local" in agg.columns:
+        agg = agg.drop(columns=["t0_local"])
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     agg.to_parquet(dst, index=False)
