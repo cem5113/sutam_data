@@ -3,21 +3,23 @@
 
 """
 aggregate_all.py — runtime-anchored multi-window aggregation
-Girdi  : Saatlik full-grid parquet (kolonlar: GEOID, dt, (ops.) crime_count, Y_label, diğer numerikler)
+Girdi  : Saatlik full-grid parquet (GEOID, dt, crime_count?, Y_label?, diğer numerikler)
 Çıktı  : sf_crime_grid_{3h,8h,1d,1w,1m}.parquet
+
 Pencereler:
-  - 3H, 8H: gün içi blokları run-time gün başlangıcına göre hizalar (block_id üretir)
-  - 1D: 1 günlük pencereler (anchor'lı)
-  - 1W: 7 günlük pencereler (anchor'lı)
-  - 1M: 30 günlük pencereler (anchor'lı)
+  3H, 8H: run-time gün başlangıcına göre hizalı bloklar (block_id üretir)
+  1D: 1 günlük
+  1W: 7 günlük
+  1M: 30 günlük (takvim ayı değil)
+
 Toplama:
-  - crime_count: SUM (yoksa satır içi olay sayısından üretilmiş olabilir)
-  - diğer numeric kolonlar: MEAN
+  crime_count → SUM, diğer numerikler → MEAN
 Etiket:
-  - Y_label: pencere içinde >=1 olay → 1; değilse 0
+  Y_label = (pencere içinde crime_count > 0)
 Priors (leakage-safe):
-  - 28D ve 180D rolling, 3H/8H için anahtar: GEOID×day_of_week×block_id
-  - 1D/1W/1M için anahtar: GEOID×day_of_week
+  28D ve 180D rolling
+    - 3H/8H: keys = GEOID, day_of_week, block_id
+    - 1D/1W/1M: keys = GEOID, day_of_week
 Kullanım:
   python -u aggregate_all.py --input sf_crime_grid_full_labeled.parquet --freqs "3H,8H,1D,1W,1M" --tz America/Los_Angeles
 """
@@ -30,7 +32,7 @@ from typing import Optional, List, Tuple
 import numpy as np
 import pandas as pd
 
-CAL_DROP = {"dt_local"}  # Eski yardımcı kolon varsa temizleriz
+CAL_DROP = {"dt_local"}  # varsa atarız
 
 
 # -------------------------
@@ -41,21 +43,21 @@ def _now_tz(tz: Optional[str]) -> pd.Timestamp:
 
 def _anchored_floor(series: pd.Series, freq: str, tz: Optional[str]) -> pd.Series:
     """
-    Pencereleri takvim başlangıcına değil, run-time gün başlangıcına (origin) hizalar.
+    Pencereleri takvim başlangıcına değil, çalıştırma anının gün başına (origin) hizalar.
     """
     anchor = _now_tz(tz)
     origin = anchor.floor("D")
     s = pd.to_datetime(series)
-    # pandas >= 2.1: floor(origin=...) desteği var; eski sürümler için fallback
     try:
+        # pandas >= 2.1
         return s.dt.floor(freq=freq, origin=origin)
     except TypeError:
-        # Eski pandas'ta origin parametresi yok → yaklaşıklaştırma:
-        # (s - origin) farkını freq'e böl, sonra tekrar origin'e ekle
+        # Eski pandas için yaklaşık çözüm
         delta = (s - origin).dt.total_seconds()
         step = pd.Timedelta(freq).total_seconds()
         bins = np.floor(delta / step) * step
-        return (origin + pd.to_timedelta(bins, unit="s")).astype("datetime64[ns, UTC]")
+        return (origin + pd.to_timedelta(bins, unit="s")).dt.tz_convert("UTC") if s.dt.tz is not None \
+               else (origin + pd.to_timedelta(bins, unit="s")).dt.tz_localize("UTC")
 
 def _anchored_day0(dt_local: pd.Series, tz: Optional[str]) -> pd.Series:
     return _anchored_floor(dt_local, "1D", tz)
@@ -63,6 +65,13 @@ def _anchored_day0(dt_local: pd.Series, tz: Optional[str]) -> pd.Series:
 def to_local(s_utc: pd.Series, tz: Optional[str]) -> pd.Series:
     s_utc = pd.to_datetime(s_utc, utc=True)
     return s_utc.dt.tz_convert(tz) if tz else s_utc
+
+def _ns64(x: pd.Series) -> pd.Series:
+    """tz-aware datetime64'ü int64 ns'e güvenli çevir."""
+    x = pd.to_datetime(x)
+    # .view('int64') bazı sürümlerde uyarı veriyor; astype daha güvenli
+    return x.astype("int64")
+
 
 def make_t0_and_block(dt_local: pd.Series, freq: str, tz: Optional[str]) -> Tuple[pd.Series, Optional[pd.Series]]:
     """
@@ -72,12 +81,12 @@ def make_t0_and_block(dt_local: pd.Series, freq: str, tz: Optional[str]) -> Tupl
     if freq == "3H":
         t0_local = _anchored_floor(dt_local, "3H", tz)
         day0 = _anchored_day0(dt_local, tz)
-        hrs_since = (dt_local.view("int64") - day0.view("int64")) / 3_600_000_000_000
+        hrs_since = (_ns64(dt_local) - _ns64(day0)) / 3_600_000_000_000
         block_id = np.floor(hrs_since / 3.0).astype("int8")
     elif freq == "8H":
         t0_local = _anchored_floor(dt_local, "8H", tz)
         day0 = _anchored_day0(dt_local, tz)
-        hrs_since = (dt_local.view("int64") - day0.view("int64")) / 3_600_000_000_000
+        hrs_since = (_ns64(dt_local) - _ns64(day0)) / 3_600_000_000_000
         block_id = np.floor(hrs_since / 8.0).astype("int8")
     elif freq == "1D":
         t0_local = _anchored_floor(dt_local, "1D", tz)
@@ -145,7 +154,6 @@ def aggregate_one(df_hourly: pd.DataFrame, freq: str, tz: Optional[str]) -> pd.D
     agg_map = {}
     if "crime_count" in sdf.columns:
         agg_map["crime_count"] = "sum"
-    # Diğer numerikler MEAN
     other_nums = [c for c in num_cols if c != "crime_count"]
     agg_map.update({c: "mean" for c in other_nums})
 
@@ -160,7 +168,6 @@ def aggregate_one(df_hourly: pd.DataFrame, freq: str, tz: Optional[str]) -> pd.D
     # 4) t0 (UTC) üret
     t0_loc = pd.to_datetime(agg["t0_local"], errors="coerce")
     if getattr(t0_loc.dt, "tz", None) is None:
-        # local tz bilgisi yoksa argüman tz'sini kabul edip UTC'ye çevir
         agg["t0"] = t0_loc.dt.tz_localize(tz or "UTC").dt.tz_convert("UTC")
     else:
         agg["t0"] = t0_loc.dt.tz_convert("UTC")
