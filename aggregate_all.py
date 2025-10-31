@@ -6,13 +6,13 @@ on:
       persist:
         description: "Çıktılar nasıl saklansın?"
         type: choice
-        options: [artifact, commit, none]
-        default: artifact
+        options: ["artifact", "commit", "none"]   # ✅ string
+        default: "artifact"
       granularity:
         description: "Hangi model(ler) eğitilsin?"
         type: choice
         options: ["hourly", "8h", "1d", "all"]
-        default: hourly
+        default: "hourly"
       balanced:
         description: "Saatlik modeli (yalnızca bayrak) dengele"
         type: boolean
@@ -74,8 +74,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          prefer_09="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_09.parquet' -print -quit || true)"
-          prefer_10="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_10.parquet' -print -quit || true)"
+          prefer_09="$(
+            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_09.parquet' -print -quit || true
+          )"
+          prefer_10="$(
+            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_10.parquet' -print -quit || true
+          )"
 
           if [ -n "${prefer_09}" ]; then
             INPUT="${prefer_09}"
@@ -89,19 +93,24 @@ jobs:
           echo "input=${INPUT}" >> "$GITHUB_OUTPUT"
           echo "✅ INPUT=${INPUT}"
 
-          RH="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f \( -name 'risk_hourly.parquet' -o -name 'risky_hours.parquet' \) -print -quit || true)"
-          MET="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'metrics_stacking_ohe.parquet' -print -quit || true)"
+          RH="$(
+            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f \( -name 'risk_hourly.parquet' -o -name 'risky_hours.parquet' \) -print -quit || true
+          )"
+          MET="$(
+            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'metrics_stacking_ohe.parquet' -print -quit || true
+          )"
           [ -n "${RH}" ] && echo "risky_hours=${RH}" >> "$GITHUB_OUTPUT"
           [ -n "${MET}" ] && echo "metrics=${MET}"     >> "$GITHUB_OUTPUT"
 
       - name: Build labels + priors (+ package)
+        shell: bash
         run: |
           set -euo pipefail
           INPUT="${{ steps.detect.outputs.input }}"
           OUT_PQ="${DATA_DIR}/${OUT_FILE}"
           OUT_ZIP="${DATA_DIR}/${OUT_ZIP}"
 
-          EXTRA_ARGS=()
+          declare -a EXTRA_ARGS=()
           [ -n "${{ steps.detect.outputs.risky_hours }}" ] && EXTRA_ARGS+=( --risky-hours "${{ steps.detect.outputs.risky_hours }}" )
           [ -n "${{ steps.detect.outputs.metrics }}" ]     && EXTRA_ARGS+=( --metrics     "${{ steps.detect.outputs.metrics }}" )
 
@@ -137,6 +146,10 @@ jobs:
         run: |
           set -euo pipefail
           echo "▶️  aggregate_all.py (${{ github.event.inputs.windows }})"
+          if [ ! -f aggregate_all.py ]; then
+            echo "⚠️ aggregate_all.py bulunamadı, adım atlanıyor."
+            exit 0
+          fi
           python -u aggregate_all.py \
             --input "${{ env.DATA_DIR }}/${{ env.OUT_FILE }}" \
             --freqs "${{ github.event.inputs.windows }}" \
@@ -173,6 +186,10 @@ jobs:
         run: |
           set -euo pipefail
           echo "▶️  train_multi_windows.py"
+          if [ ! -f train_multi_windows.py ]; then
+            echo "⚠️ train_multi_windows.py bulunamadı, adım atlanıyor."
+            exit 0
+          fi
           python -u train_multi_windows.py \
             --dir "." \
             --prefix "sf_crime_grid_" \
@@ -183,13 +200,17 @@ jobs:
       - name: Run risk_forecast (multi-window predictions)
         run: |
           set -euo pipefail
-          echo "▶️  risk_forecast.py (freq=auto, horizon=${{ github.event.inputs.horizon }}, topk=${{ github.event.inputs.topk }})"
-          python -u risk_forecast.py \
-            --freq auto \
-            --horizon "${{ github.event.inputs.horizon }}" \
-            --topk "${{ github.event.inputs.topk }}"
-          echo "✅ Forecasts oluşturuldu:"
-          ls -lh forecasts || true
+          if [ -f risk_forecast.py ]; then
+            echo "▶️  risk_forecast.py (freq=auto, horizon=${{ github.event.inputs.horizon }}, topk=${{ github.event.inputs.topk }})"
+            python -u risk_forecast.py \
+              --freq auto \
+              --horizon "${{ github.event.inputs.horizon }}" \
+              --topk "${{ github.event.inputs.topk }}"
+            echo "✅ Forecasts oluşturuldu:"
+            ls -lh forecasts || true
+          else
+            echo "ℹ️ risk_forecast.py bulunamadı, forecast adımı atlandı."
+          fi
 
       - name: Upload artifacts (if selected)
         if: ${{ github.event.inputs.persist == 'artifact' }}
@@ -200,8 +221,7 @@ jobs:
             ${{ env.DATA_DIR }}/${{ env.OUT_FILE }}
             ${{ env.DATA_DIR }}/${{ env.OUT_ZIP }}
             ${{ env.DATA_DIR }}/y_label_stats.csv
-            sf_crime_grid_8h.parquet
-            sf_crime_grid_1d.parquet
+            sf_crime_grid_*.parquet
             models/*.joblib
             reports/*.json
             reports/*.csv
@@ -219,8 +239,7 @@ jobs:
           git add "${DATA_DIR}/${OUT_FILE}" || true
           git add "${DATA_DIR}/${OUT_ZIP}"  || true
           [ -f "${DATA_DIR}/y_label_stats.csv" ] && git add "${DATA_DIR}/y_label_stats.csv" || true
-          [ -f sf_crime_grid_8h.parquet ] && git add sf_crime_grid_8h.parquet || true
-          [ -f sf_crime_grid_1d.parquet ] && git add sf_crime_grid_1d.parquet || true
+          git add sf_crime_grid_*.parquet 2>/dev/null || true
           git add models/*.joblib 2>/dev/null || true
           git add reports/* 2>/dev/null || true
           git add forecasts/* 2>/dev/null || true
