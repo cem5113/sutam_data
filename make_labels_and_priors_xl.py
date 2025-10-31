@@ -145,10 +145,14 @@ def _prior_rolling(df: pd.DataFrame, window: str, suffix: str,
 
     # >>> KRİTİK: include_groups=True + observed=False (uyarıyı susturur)
     try:
+        # Yeni pandas (>=2.2) — anahtarlar direkt çıktıda
         out = df.groupby(grp_cols, group_keys=False, observed=False).apply(_roll, include_groups=True)
     except TypeError:
-        # Eski pandas için (parametre yoksa)
-        out = df.groupby(grp_cols, group_keys=False, observed=False).apply(_roll)
+        # Eski pandas — anahtarlar index seviyelerine yazılır; reset_index ile geri al
+        out = df.groupby(grp_cols, observed=False).apply(_roll)
+        # GroupBy.apply sonucu genelde MultiIndex taşır; kolonlara indir:
+        if not set(grp_cols).issubset(out.columns):
+            out = out.reset_index(level=range(len(grp_cols)), names=grp_cols).reset_index(drop=True)
 
     if "GEOID" not in out.columns:
         raise RuntimeError("Internal: apply sonrası GEOID kayboldu; pandas sürümünü ve include_groups=True kullanımını kontrol edin.")
