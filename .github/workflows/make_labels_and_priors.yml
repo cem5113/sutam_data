@@ -8,10 +8,6 @@ on:
         type: choice
         options: [artifact, commit, none]
         default: artifact
-      balanced:
-        description: "Saatlik modeli (yalnızca bayrak) dengele"
-        type: boolean
-        default: false
       windows:
         description: "Multi-window frekansları (virgülle): 3H,8H,1D,1W,1M"
         default: "3H,8H,1D,1W,1M"
@@ -66,19 +62,28 @@ jobs:
 
       - name: Detect input parquet & optional files
         id: detect
+        shell: bash
         run: |
           set -euo pipefail
-          prefer_09="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_09.parquet' -print -quit)" || true
-          if [ -n "${prefer_10}" ]; then INPUT="${prefer_10}"; elif [ -n "${prefer_09}" ]; then INPUT="${prefer_09}"; else echo "❌ fr_crime_09.parquet yok"; exit 1; fi
+          prefer_09="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_09.parquet' -print -quit || true)"
+          prefer_10="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_10.parquet' -print -quit || true)"
+          if [ -n "${prefer_09}" ]; then
+            INPUT="${prefer_09}"
+          elif [ -n "${prefer_10}" ]; then
+            INPUT="${prefer_10}"
+          else
+            echo "❌ fr_crime_09.parquet ya da fr_crime_10.parquet bulunamadı."; exit 1
+          fi
           echo "input=${INPUT}" >> "$GITHUB_OUTPUT"
           echo "✅ INPUT=${INPUT}"
 
-          RH="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f \( -name 'risk_hourly.parquet' -o -name 'risky_hours.parquet' \) -print -quit)" || true
-          MET="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'metrics_stacking_ohe.parquet' -print -quit)" || true
+          RH="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f \( -name 'risk_hourly.parquet' -o -name 'risky_hours.parquet' \) -print -quit || true)"
+          MET="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'metrics_stacking_ohe.parquet' -print -quit || true)"
           [ -n "${RH}" ] && echo "risky_hours=${RH}" >> "$GITHUB_OUTPUT"
           [ -n "${MET}" ] && echo "metrics=${MET}"     >> "$GITHUB_OUTPUT"
 
       - name: Build labels + priors (+ package)
+        shell: bash
         run: |
           set -euo pipefail
           INPUT="${{ steps.detect.outputs.input }}"
@@ -101,25 +106,18 @@ jobs:
           test -s "${OUT_PQ}" || { echo "❌ Output parquet yok: ${OUT_PQ}"; exit 1; }
           [ -f "${DATA_DIR}/y_label_stats.csv" ] && { echo "Y_label stats:"; cat "${DATA_DIR}/y_label_stats.csv" || true; }
 
-      # Tüm pencereler için (run-time hizalı) agregasyon
       - name: Aggregate multi-windows (3H/8H/1D/1W/1M)
+        shell: bash
         run: |
           set -euo pipefail
-          echo "▶️  aggregate_all.py (${ { github.event.inputs.windows } })"
+          echo "▶️  aggregate_all.py (${{ github.event.inputs.windows }})"
           python -u aggregate_all.py \
             --input "${{ env.DATA_DIR }}/${{ env.OUT_FILE }}" \
             --freqs "${{ github.event.inputs.windows }}" \
             --tz America/Los_Angeles
 
-      # Saatlik eğitimi her zaman çalıştır
-      - name: Train hourly model
-        run: |
-          set -euo pipefail
-          echo "▶️  train_hourly_model.py (balanced=${{ github.event.inputs.balanced }})"
-          python -u train_hourly_model.py
-
-      # Çoklu pencereleri eğit
       - name: Train multi-windows (3H/8H/1D/1W/1M)
+        shell: bash
         run: |
           set -euo pipefail
           echo "▶️  train_multi_windows.py"
@@ -129,8 +127,8 @@ jobs:
             --freqs "${{ github.event.inputs.windows }}" \
             --undersample "0.0"
 
-      # (Varsa) Forecast
-      - name: Run risk_forecast (multi-window predictions)
+      - name: Run risk_forecast (multi-window predictions) — optional
+        shell: bash
         run: |
           set -euo pipefail
           if [ -f risk_forecast.py ]; then
@@ -163,12 +161,13 @@ jobs:
 
       - name: Commit outputs (if selected)
         if: ${{ github.event.inputs.persist == 'commit' }}
+        shell: bash
         run: |
           set -e
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${DATA_DIR}/${OUT_FILE}" || true
-          git add "${DATA_DIR}/${OUT_ZIP}"  || true
+          git add "${DATA_DIR}/${OUT_FILE}" 2>/dev/null || true
+          git add "${DATA_DIR}/${OUT_ZIP}"  2>/dev/null || true
           [ -f "${DATA_DIR}/y_label_stats.csv" ] && git add "${DATA_DIR}/y_label_stats.csv" || true
           git add sf_crime_grid_*.parquet 2>/dev/null || true
           git add models/*.joblib 2>/dev/null || true
@@ -182,13 +181,13 @@ jobs:
           git push origin "${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}"
 
       - name: Job summary
+        shell: bash
         run: |
           set -e
           {
             echo "## Make Labels + Train — Özet"
             echo "- Input: \`${{ steps.detect.outputs.input }}\`"
             echo "- Windows: \`${{ github.event.inputs.windows }}\`"
-            echo "- Balanced(hourly): \`${{ github.event.inputs.balanced }}\`"
             echo "- Forecast: horizon=\`${{ github.event.inputs.horizon }}\`, topk=\`${{ github.event.inputs.topk }}\`"
             [ -n "${{ steps.detect.outputs.risky_hours }}" ] && echo "- risky_hours: \`${{ steps.detect.outputs.risky_hours }}\`"
             [ -n "${{ steps.detect.outputs.metrics }}" ] && echo "- metrics: \`${{ steps.detect.outputs.metrics }}\`"
