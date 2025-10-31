@@ -6,7 +6,7 @@ on:
       persist:
         description: "Çıktılar nasıl saklansın?"
         type: choice
-        options: ["artifact", "commit", "none"]   # ✅ string
+        options: ["artifact", "commit", "none"]   # ✅ string olmalı
         default: "artifact"
       granularity:
         description: "Hangi model(ler) eğitilsin?"
@@ -47,7 +47,9 @@ jobs:
           lfs: true
 
       - name: Show workspace
+        shell: bash
         run: |
+          set -euo pipefail
           echo "PWD=$(pwd)"
           ls -lah
 
@@ -59,7 +61,9 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Install dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install -U pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
@@ -74,12 +78,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          prefer_09="$(
-            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_09.parquet' -print -quit || true
-          )"
-          prefer_10="$(
-            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_10.parquet' -print -quit || true
-          )"
+          prefer_09="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_09.parquet' -print -quit || true)"
+          prefer_10="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_10.parquet' -print -quit || true)"
 
           if [ -n "${prefer_09}" ]; then
             INPUT="${prefer_09}"
@@ -89,18 +89,13 @@ jobs:
             echo "❌ fr_crime_09.parquet / fr_crime_10.parquet bulunamadı."
             exit 1
           fi
-
           echo "input=${INPUT}" >> "$GITHUB_OUTPUT"
           echo "✅ INPUT=${INPUT}"
 
-          RH="$(
-            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f \( -name 'risk_hourly.parquet' -o -name 'risky_hours.parquet' \) -print -quit || true
-          )"
-          MET="$(
-            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'metrics_stacking_ohe.parquet' -print -quit || true
-          )"
-          [ -n "${RH}" ] && echo "risky_hours=${RH}" >> "$GITHUB_OUTPUT"
-          [ -n "${MET}" ] && echo "metrics=${MET}"     >> "$GITHUB_OUTPUT"
+          RH="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f \( -name 'risk_hourly.parquet' -o -name 'risky_hours.parquet' \) -print -quit || true)"
+          MET="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'metrics_stacking_ohe.parquet' -print -quit || true)"
+          if [ -n "${RH}" ]; then echo "risky_hours=${RH}" >> "$GITHUB_OUTPUT"; fi
+          if [ -n "${MET}" ]; then echo "metrics=${MET}" >> "$GITHUB_OUTPUT"; fi
 
       - name: Build labels + priors (+ package)
         shell: bash
@@ -129,6 +124,7 @@ jobs:
       # ---- 8H / 1D agregasyon (opsiyonel – eski adım)
       - name: Aggregate to 8H and/or 1D
         if: ${{ github.event.inputs.granularity == '8h' || github.event.inputs.granularity == '1d' || github.event.inputs.granularity == 'all' }}
+        shell: bash
         run: |
           set -euo pipefail
           INPUT="${{ env.DATA_DIR }}/${{ env.OUT_FILE }}"
@@ -143,11 +139,12 @@ jobs:
 
       # ---- Multi-window agregasyon (3H/8H/1D/1W/1M) – dinamik hizalı
       - name: Aggregate multi-windows (3H/8H/1D/1W/1M)
+        shell: bash
         run: |
           set -euo pipefail
           echo "▶️  aggregate_all.py (${{ github.event.inputs.windows }})"
           if [ ! -f aggregate_all.py ]; then
-            echo "⚠️ aggregate_all.py bulunamadı, adım atlanıyor."
+            echo "ℹ️ aggregate_all.py bulunamadı, adım atlanıyor."
             exit 0
           fi
           python -u aggregate_all.py \
@@ -155,39 +152,43 @@ jobs:
             --freqs "${{ github.event.inputs.windows }}" \
             --tz America/Los_Angeles
 
-      # ---- Saatlik eğitim (tek script)
+      # ---- Saatlik eğitim
       - name: Train hourly model
         if: ${{ github.event.inputs.granularity == 'hourly' || github.event.inputs.granularity == 'all' }}
+        shell: bash
         run: |
           set -euo pipefail
           echo "▶️  train_hourly_model.py (balanced=${{ github.event.inputs.balanced }})"
           python -u train_hourly_model.py
 
-      # ---- 8H eğitim (aynı script, input parametre veriyoruz)
+      # ---- 8H eğitim
       - name: Train 8H model
         if: ${{ github.event.inputs.granularity == '8h' || github.event.inputs.granularity == 'all' }}
+        shell: bash
         run: |
           set -euo pipefail
-          test -s sf_crime_grid_8h.parquet || { echo "8H dosyası yok, eğitim atlandı."; exit 0; }
+          test -s sf_crime_grid_8h.parquet || { echo "ℹ️ 8H dosyası yok, eğitim atlandı."; exit 0; }
           echo "▶️  train_hourly_model.py (8H)"
           python -u train_hourly_model.py --input sf_crime_grid_8h.parquet --freq 8H --tz America/Los_Angeles
 
       # ---- 1D eğitim
       - name: Train 1D model
         if: ${{ github.event.inputs.granularity == '1d' || github.event.inputs.granularity == 'all' }}
+        shell: bash
         run: |
           set -euo pipefail
-          test -s sf_crime_grid_1d.parquet || { echo "1D dosyası yok, eğitim atlandı."; exit 0; }
+          test -s sf_crime_grid_1d.parquet || { echo "ℹ️ 1D dosyası yok, eğitim atlandı."; exit 0; }
           echo "▶️  train_hourly_model.py (1D)"
           python -u train_hourly_model.py --input sf_crime_grid_1d.parquet --freq 1D --tz America/Los_Angeles
 
       # ---- Multi-window eğitim (3H/8H/1D/1W/1M)
       - name: Train multi-windows (3H/8H/1D/1W/1M)
+        shell: bash
         run: |
           set -euo pipefail
           echo "▶️  train_multi_windows.py"
           if [ ! -f train_multi_windows.py ]; then
-            echo "⚠️ train_multi_windows.py bulunamadı, adım atlanıyor."
+            echo "ℹ️ train_multi_windows.py bulunamadı, adım atlanıyor."
             exit 0
           fi
           python -u train_multi_windows.py \
@@ -196,8 +197,9 @@ jobs:
             --freqs "${{ github.event.inputs.windows }}" \
             --undersample "0.0"
 
-      # ---- Forecast (multi-window) — çalıştırma zamanına göre hizalı
+      # ---- Forecast (multi-window)
       - name: Run risk_forecast (multi-window predictions)
+        shell: bash
         run: |
           set -euo pipefail
           if [ -f risk_forecast.py ]; then
@@ -232,8 +234,9 @@ jobs:
 
       - name: Commit outputs (if selected)
         if: ${{ github.event.inputs.persist == 'commit' }}
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "${DATA_DIR}/${OUT_FILE}" || true
@@ -251,8 +254,9 @@ jobs:
           git push origin "${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}"
 
       - name: Job summary
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           {
             echo "## Make Labels + Train — Özet"
             echo "- Input: \`${{ steps.detect.outputs.input }}\`"
