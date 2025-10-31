@@ -135,7 +135,13 @@ def _prior_rolling(df: pd.DataFrame, window: str, suffix: str,
         return g
 
     # FutureWarning fix: include_groups=False
-    out = df.groupby(grp_cols, group_keys=False).apply(_roll, include_groups=False)
+    try:
+        # pandas ≥ 2.1: include_groups parametresi mevcut
+        out = df.groupby(grp_cols, group_keys=False).apply(_roll, include_groups=True)
+    except TypeError:
+        # Eski pandas sürümleri için (parametre yoksa)
+        out = df.groupby(grp_cols, group_keys=False).apply(_roll)
+
 
     hours_in_window = float(pd.Timedelta(window) / pd.Timedelta("1h"))
     out[f"prior_p_{suffix}"] = (out[f"prior_cnt_{suffix}"] / hours_in_window).astype("float32")
