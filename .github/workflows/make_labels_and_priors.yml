@@ -136,25 +136,28 @@ jobs:
         if: ${{ github.event.inputs.granularity == '8h' || github.event.inputs.granularity == '1d' || github.event.inputs.granularity == 'all' }}
         run: |
           set -euo pipefail
-          MAKE_8H=false
-          MAKE_1D=false
+          INPUT="${{ env.DATA_DIR }}/${{ env.OUT_FILE }}"  # sf_crime_grid_full_labeled.parquet
+      
           if [ "${{ github.event.inputs.granularity }}" = "8h" ] || [ "${{ github.event.inputs.granularity }}" = "all" ]; then
-            MAKE_8H=true
+            echo "▶️  aggregate_windows.py (8H)"
+            python -u aggregate_windows.py \
+              --input "${INPUT}" \
+              --out   "sf_crime_grid_8h.parquet" \
+              --freq  8H \
+              --tz    America/Los_Angeles
           fi
+      
           if [ "${{ github.event.inputs.granularity }}" = "1d" ] || [ "${{ github.event.inputs.granularity }}" = "all" ]; then
-            MAKE_1D=true
+            echo "▶️  aggregate_windows.py (1D)"
+            python -u aggregate_windows.py \
+              --input "${INPUT}" \
+              --out   "sf_crime_grid_1d.parquet" \
+              --freq  1D \
+              --tz    America/Los_Angeles
           fi
-
-          ARGS=()
-          $MAKE_8H && ARGS+=( --make-8h )
-          $MAKE_1D && ARGS+=( --make-1d )
-
-          echo "▶️  aggregate_windows.py ${ARGS[*]}"
-          python -u aggregate_windows.py "${ARGS[@]}"
-
+      
           ls -lh sf_crime_grid_8h.parquet || true
           ls -lh sf_crime_grid_1d.parquet || true
-
       # ---- Saatlik eğitim: balanced seçimine göre script
       - name: Train hourly model (balanced or vanilla)
         if: ${{ github.event.inputs.granularity == 'hourly' || github.event.inputs.granularity == 'all' }}
