@@ -14,7 +14,7 @@ on:
         options: [hourly, 8h, 1d, all]
         default: hourly
       balanced:
-        description: "Saatlik modeli SMOTE/downsample ile dengele"
+        description: "Saatlik modeli (yalnızca bayrak) dengele"
         type: boolean
         default: false
 
@@ -55,7 +55,6 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            # Minimal ama blok/smote için de yeterli
             pip install numpy pandas pyarrow tqdm scipy \
                         scikit-learn xgboost lightgbm imbalanced-learn \
                         joblib matplotlib
@@ -65,40 +64,16 @@ jobs:
         id: detect
         run: |
           set -euo pipefail
-
-          prefer_10="$(
-            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_10.parquet' -print -quit
-          )" || true
-          prefer_09="$(
-            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_09.parquet' -print -quit
-          )" || true
-
-          if [ -n "${prefer_10}" ]; then
-            INPUT="${prefer_10}"
-          elif [ -n "${prefer_09}" ]; then
-            INPUT="${prefer_09}"
-          else
-            echo "❌ fr_crime_10.parquet / fr_crime_09.parquet bulunamadı."
-            exit 1
-          fi
-
+          prefer_10="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_10.parquet' -print -quit)" || true
+          prefer_09="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_09.parquet' -print -quit)" || true
+          if [ -n "${prefer_10}" ]; then INPUT="${prefer_10}"; elif [ -n "${prefer_09}" ]; then INPUT="${prefer_09}"; else echo "❌ fr_crime_10.parquet / fr_crime_09.parquet yok"; exit 1; fi
           echo "input=${INPUT}" >> "$GITHUB_OUTPUT"
           echo "✅ INPUT=${INPUT}"
 
-          RH="$(
-            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f \( -name 'risk_hourly.parquet' -o -name 'risky_hours.parquet' \) -print -quit
-          )" || true
-          MET="$(
-            /usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'metrics_stacking_ohe.parquet' -print -quit
-          )" || true
-
-          if [ -n "${RH}" ]; then echo "risky_hours=${RH}" >> "$GITHUB_OUTPUT"; fi
-          if [ -n "${MET}" ]; then echo "metrics=${MET}"     >> "$GITHUB_OUTPUT"; fi
-
-          echo "---- Detect summary ----"
-          echo "INPUT: ${INPUT}"
-          echo "RISKY: ${RH:-<none>}"
-          echo "METRICS: ${MET:-<none>}"
+          RH="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f \( -name 'risk_hourly.parquet' -o -name 'risky_hours.parquet' \) -print -quit)" || true
+          MET="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'metrics_stacking_ohe.parquet' -print -quit)" || true
+          [ -n "${RH}" ] && echo "risky_hours=${RH}" >> "$GITHUB_OUTPUT"
+          [ -n "${MET}" ] && echo "metrics=${MET}"     >> "$GITHUB_OUTPUT"
 
       - name: Build labels + priors (+ package)
         run: |
@@ -108,14 +83,10 @@ jobs:
           OUT_ZIP="${DATA_DIR}/${OUT_ZIP}"
 
           EXTRA_ARGS=()
-          if [ -n "${{ steps.detect.outputs.risky_hours }}" ]; then
-            EXTRA_ARGS+=( --risky-hours "${{ steps.detect.outputs.risky_hours }}" )
-          fi
-          if [ -n "${{ steps.detect.outputs.metrics }}" ]; then
-            EXTRA_ARGS+=( --metrics     "${{ steps.detect.outputs.metrics }}" )
-          fi
+          [ -n "${{ steps.detect.outputs.risky_hours }}" ] && EXTRA_ARGS+=( --risky-hours "${{ steps.detect.outputs.risky_hours }}" )
+          [ -n "${{ steps.detect.outputs.metrics }}" ]     && EXTRA_ARGS+=( --metrics     "${{ steps.detect.outputs.metrics }}" )
 
-          echo "▶️  Running make_labels_and_priors_xl.py ..."
+          echo "▶️  make_labels_and_priors_xl.py"
           python -u make_labels_and_priors_xl.py \
             --input       "${INPUT}" \
             --out         "${OUT_PQ}" \
@@ -127,75 +98,47 @@ jobs:
           test -s "${OUT_PQ}" || { echo "❌ Output parquet yok: ${OUT_PQ}"; exit 1; }
           [ -f "${DATA_DIR}/y_label_stats.csv" ] && { echo "Y_label stats:"; cat "${DATA_DIR}/y_label_stats.csv" || true; }
 
-          echo "---- Outputs ----"
-          ls -lh "${OUT_PQ}" || true
-          ls -lh "${OUT_ZIP}" || true
-
-      # ---- 8H / 1D için agregasyon
+      # ---- 8H / 1D agregasyon (opsiyonel)
       - name: Aggregate to 8H and/or 1D
         if: ${{ github.event.inputs.granularity == '8h' || github.event.inputs.granularity == '1d' || github.event.inputs.granularity == 'all' }}
         run: |
           set -euo pipefail
-          INPUT="${{ env.DATA_DIR }}/${{ env.OUT_FILE }}"  # sf_crime_grid_full_labeled.parquet
-      
+          INPUT="${{ env.DATA_DIR }}/${{ env.OUT_FILE }}"
           if [ "${{ github.event.inputs.granularity }}" = "8h" ] || [ "${{ github.event.inputs.granularity }}" = "all" ]; then
             echo "▶️  aggregate_windows.py (8H)"
-            python -u aggregate_windows.py \
-              --input "${INPUT}" \
-              --out   "sf_crime_grid_8h.parquet" \
-              --freq  8H \
-              --tz    America/Los_Angeles
+            python -u aggregate_windows.py --input "${INPUT}" --out "sf_crime_grid_8h.parquet" --freq 8H --tz America/Los_Angeles
           fi
-      
           if [ "${{ github.event.inputs.granularity }}" = "1d" ] || [ "${{ github.event.inputs.granularity }}" = "all" ]; then
             echo "▶️  aggregate_windows.py (1D)"
-            python -u aggregate_windows.py \
-              --input "${INPUT}" \
-              --out   "sf_crime_grid_1d.parquet" \
-              --freq  1D \
-              --tz    America/Los_Angeles
+            python -u aggregate_windows.py --input "${INPUT}" --out "sf_crime_grid_1d.parquet" --freq 1D --tz America/Los_Angeles
           fi
-      
-          ls -lh sf_crime_grid_8h.parquet || true
-          ls -lh sf_crime_grid_1d.parquet || true
-      # ---- Saatlik eğitim: balanced seçimine göre script
-      - name: Train hourly model (balanced or vanilla)
+
+      # ---- Saatlik eğitim (tek script)
+      - name: Train hourly model
         if: ${{ github.event.inputs.granularity == 'hourly' || github.event.inputs.granularity == 'all' }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event.inputs.balanced }}" = "true" ]; then
-            echo "▶️  train_hourly_model_balanced.py"
-            python -u train_hourly_model_balanced.py
-          else
-            echo "▶️  train_hourly_model.py"
-            python -u train_hourly_model.py
-          fi
+          echo "▶️  train_hourly_model.py (balanced=${{ github.event.inputs.balanced }})"
+          # Not: balanced=True şu an yalnızca raporlama amaçlı; script tek.
+          python -u train_hourly_model.py
 
-      # ---- 8H eğitim
+      # ---- 8H eğitim (aynı script, input parametre veriyoruz)
       - name: Train 8H model
         if: ${{ github.event.inputs.granularity == '8h' || github.event.inputs.granularity == 'all' }}
         run: |
           set -euo pipefail
+          test -s sf_crime_grid_8h.parquet || { echo "8H dosyası yok, eğitim atlandı."; exit 0; }
           echo "▶️  train_hourly_model.py (8H)"
-          ls -lah
-          # 8H penceresi oluşturulmuşsa (sf_crime_grid_8h.parquet)
-          python -u train_hourly_model.py \
-            --input sf_crime_grid_8h.parquet \
-            --freq 8H \
-            --tz America/Los_Angeles
+          python -u train_hourly_model.py --input sf_crime_grid_8h.parquet --freq 8H --tz America/Los_Angeles
 
       # ---- 1D eğitim
       - name: Train 1D model
         if: ${{ github.event.inputs.granularity == '1d' || github.event.inputs.granularity == 'all' }}
         run: |
           set -euo pipefail
+          test -s sf_crime_grid_1d.parquet || { echo "1D dosyası yok, eğitim atlandı."; exit 0; }
           echo "▶️  train_hourly_model.py (1D)"
-          ls -lah
-          # 1D versiyonu oluşturulmuşsa (sf_crime_grid_1d.parquet)
-          python -u train_hourly_model.py \
-            --input sf_crime_grid_1d.parquet \
-            --freq 1D \
-            --tz America/Los_Angeles
+          python -u train_hourly_model.py --input sf_crime_grid_1d.parquet --freq 1D --tz America/Los_Angeles
 
       - name: Upload artifacts (if selected)
         if: ${{ github.event.inputs.persist == 'artifact' }}
@@ -206,10 +149,8 @@ jobs:
             ${{ env.DATA_DIR }}/${{ env.OUT_FILE }}
             ${{ env.DATA_DIR }}/${{ env.OUT_ZIP }}
             ${{ env.DATA_DIR }}/y_label_stats.csv
-            # Agregasyon çıktıları (varsa)
             sf_crime_grid_8h.parquet
             sf_crime_grid_1d.parquet
-            # Modeller & raporlar
             models/*.joblib
             reports/*.json
             reports/*.csv
@@ -229,7 +170,6 @@ jobs:
           [ -f sf_crime_grid_1d.parquet ] && git add sf_crime_grid_1d.parquet || true
           git add models/*.joblib 2>/dev/null || true
           git add reports/* 2>/dev/null || true
-
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
@@ -242,24 +182,13 @@ jobs:
           set -e
           {
             echo "## Make Labels + Train — Özet"
-            echo ""
             echo "- Input: \`${{ steps.detect.outputs.input }}\`"
             echo "- Granularity: \`${{ github.event.inputs.granularity }}\`"
-            echo "- Balanced(hourly): \`${{ github.event.inputs.balanced }}\`"
-            if [ -n "${{ steps.detect.outputs.risky_hours }}" ]; then
-              echo "- risky_hours: \`${{ steps.detect.outputs.risky_hours }}\`"
-            fi
-            if [ -n "${{ steps.detect.outputs.metrics }}" ]; then
-              echo "- metrics: \`${{ steps.detect.outputs.metrics }}\`"
-            fi
+            echo "- Balanced(hourly flag): \`${{ github.event.inputs.balanced }}\`"
+            [ -n "${{ steps.detect.outputs.risky_hours }}" ] && echo "- risky_hours: \`${{ steps.detect.outputs.risky_hours }}\`"
+            [ -n "${{ steps.detect.outputs.metrics }}" ] && echo "- metrics: \`${{ steps.detect.outputs.metrics }}\`"
             echo "- Output Parquet: \`${{ env.DATA_DIR }}/${{ env.OUT_FILE }}\`"
             echo "- Output ZIP: \`${{ env.DATA_DIR }}/${{ env.OUT_ZIP }}\`"
-            if [ -f "${{ env.DATA_DIR }}/y_label_stats.csv" ]; then
-              echo ""
-              echo "### Y_label dağılımı"
-              tail -n +1 "${{ env.DATA_DIR }}/y_label_stats.csv"
-            fi
-            echo ""
-            ls -lh models 2>/dev/null || true
-            ls -lh reports 2>/dev/null || true
+            [ -f "${{ env.DATA_DIR }}/y_label_stats.csv" ] && { echo ""; echo "### Y_label dağılımı"; tail -n +1 "${{ env.DATA_DIR }}/y_label_stats.csv"; }
+            echo ""; ls -lh models 2>/dev/null || true; ls -lh reports 2>/dev/null || true
           } >> "$GITHUB_STEP_SUMMARY"
