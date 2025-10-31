@@ -2,14 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-train_block_model.py
-- aggregate_windows.py çıktısı ile (1D veya 8H) model eğitir
+train_hourly_model.py
+- Saatlik full-grid (sf_crime_grid_full_labeled.parquet) veya aggregate dosyası ile eğitim
 - Zaman bazlı split (son %20 test), sızıntısız
-- Kategorikler: year, month, day_of_week, (opsiyonel) block_id
+- Dengesizlik: scale_pos_weight + opsiyonel undersample
+- Çıktı: models/*.joblib, reports/*.json
 """
 
 from __future__ import annotations
-import json
+import argparse, json
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -20,65 +21,88 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 
-USE_XGBOOST = True
-if USE_XGBOOST:
-    from xgboost import XGBClassifier
-else:
-    from lightgbm import LGBMClassifier
+from xgboost import XGBClassifier
+import joblib
 
-# ---- Girdi (1D veya 8H)
-DATA_PATH = Path("sf_crime_grid_8h.parquet")  # 8H deneme için; günlük ise sf_crime_grid_1d.parquet yap
-if not DATA_PATH.exists():
-    raise SystemExit(f"Girdi yok: {DATA_PATH.resolve()}")
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--input", type=Path, default=Path("sf_crime_grid_full_labeled.parquet"))
+    p.add_argument("--target", type=str, default="Y_label")
+    p.add_argument("--undersample", type=float, default=0.3, help="Negatif sınıf oranı (0=kapalı, 0.3 öneri)")
+    p.add_argument("--model-out", type=Path, default=Path("models/sutam_hourly.joblib"))
+    p.add_argument("--report-out", type=Path, default=Path("reports/hourly_metrics.json"))
+    return p.parse_args()
 
-df = pd.read_parquet(DATA_PATH)
-req = {"GEOID","t0","Y_label","crime_count","year","month","day_of_week"}
-missing = req - set(df.columns)
-if missing:
-    raise SystemExit(f"Gerekli kolonlar eksik: {missing}")
+def main():
+    args = parse_args()
+    src = args.input
+    if not src.exists():
+        raise SystemExit(f"Girdi yok: {src.resolve()}")
 
-# ---- Özellikler
-DROP = {"GEOID","t0","Y_label"}  # kimlik ve hedef dışı
-CAT = ["year","month","day_of_week"]
-if "block_id" in df.columns:
-    CAT.append("block_id")  # 8H için
+    df = pd.read_parquet(src)
 
-# Numerikler: kalan tüm numerikler (count/priors dahil)
-num_cols = [c for c in df.columns if (c not in DROP) and (c not in CAT)
-            and pd.api.types.is_numeric_dtype(df[c])]
-cat_cols = [c for c in CAT if c in df.columns]
+    # Zaman kolonu: hourly'de "dt", aggregatede "t0"
+    time_col = "dt" if "dt" in df.columns else ("t0" if "t0" in df.columns else None)
+    if time_col is None:
+        raise SystemExit("Zaman kolonu bulunamadı (dt / t0).")
 
-print(f"[INFO] Numerik={len(num_cols)} | Kategorik={len(cat_cols)}")
-df = df.sort_values("t0").reset_index(drop=True)
+    req = {"GEOID", time_col, args.target}
+    missing = req - set(df.columns)
+    if missing:
+        raise SystemExit(f"Gerekli kolonlar eksik: {missing}")
 
-# ---- Split (zaman bazlı: son %20 test)
-cut = int(len(df) * 0.80)
-train, test = df.iloc[:cut].copy(), df.iloc[cut:].copy()
+    df = df.sort_values(time_col).reset_index(drop=True)
 
-X_train = train[cat_cols + num_cols]
-y_train = train["Y_label"].astype(np.int8).values
-X_test  = test[cat_cols + num_cols]
-y_test  = test["Y_label"].astype(np.int8).values
+    # Özellik seçimi
+    drop_cols = {"GEOID", time_col, args.target}
+    cat_cols = [c for c in ["year","month","day_of_week","hour","block_id"] if c in df.columns]
+    num_cols = [c for c in df.columns
+                if c not in drop_cols and c not in cat_cols and pd.api.types.is_numeric_dtype(df[c])]
 
-# ---- Pipeline (impute + OHE[sparse] + model)
-num_tf = Pipeline([("impute", SimpleImputer(strategy="median"))])
-cat_tf = Pipeline([
-    ("impute", SimpleImputer(strategy="most_frequent")),
-    ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=True, dtype=np.float32)),
-])
+    # Zaman bazlı split
+    cut = int(len(df) * 0.80)
+    train, test = df.iloc[:cut].copy(), df.iloc[cut:].copy()
 
-pre = ColumnTransformer(
-    transformers=[
-        ("num", num_tf, num_cols),
-        ("cat", cat_tf, cat_cols),
-    ],
-    remainder="drop",
-    sparse_threshold=1.0,
-)
+    # Dengesizlik bilgisi
+    y_train = train[args.target].astype(np.int8).values
+    pos = int((y_train == 1).sum())
+    neg = int((y_train == 0).sum())
+    spw = float(neg / max(1, pos)) if pos > 0 else 1.0
 
-if USE_XGBOOST:
+    # İsteğe bağlı basit undersample (negatiflerden kırp)
+    if args.undersample and args.undersample > 0:
+        neg_idx = train[train[args.target] == 0].index.to_numpy()
+        pos_idx = train[train[args.target] == 1].index.to_numpy()
+        keep_neg = int(len(neg_idx) * (1.0 - float(args.undersample)))
+        if keep_neg < len(neg_idx):
+            rng = np.random.default_rng(42)
+            keep_idx = set(rng.choice(neg_idx, size=keep_neg, replace=False).tolist()) | set(pos_idx.tolist())
+            train = train.loc[sorted(list(keep_idx))].copy()
+            y_train = train[args.target].astype(np.int8).values
+            pos = int((y_train == 1).sum()); neg = int((y_train == 0).sum())
+            spw = float(neg / max(1, pos)) if pos > 0 else 1.0
+
+    X_train = train[cat_cols + num_cols]
+    X_test  = test[cat_cols + num_cols]
+    y_test  = test[args.target].astype(np.int8).values
+
+    num_tf = Pipeline([("impute", SimpleImputer(strategy="median"))])
+    cat_tf = Pipeline([
+        ("impute", SimpleImputer(strategy="most_frequent")),
+        ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=True, dtype=np.float32)),
+    ])
+
+    pre = ColumnTransformer(
+        transformers=[
+            ("num", num_tf, num_cols),
+            ("cat", cat_tf, cat_cols),
+        ],
+        remainder="drop",
+        sparse_threshold=1.0,
+    )
+
     clf = XGBClassifier(
-        n_estimators=600,
+        n_estimators=700,
         max_depth=6,
         learning_rate=0.06,
         subsample=0.9,
@@ -90,57 +114,40 @@ if USE_XGBOOST:
         eval_metric="aucpr",
         n_jobs=4,
         random_state=42,
-    )
-else:
-    clf = LGBMClassifier(
-        n_estimators=1200,
-        learning_rate=0.06,
-        subsample=0.9,
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
-        objective="binary",
-        is_unbalance=True,   # 1D/8H’de oran daha iyi olsa da güvenli
-        n_jobs=4,
-        random_state=42,
+        scale_pos_weight=spw,
     )
 
-pipe = Pipeline([("pre", pre), ("mdl", clf)])
+    pipe = Pipeline([("pre", pre), ("mdl", clf)])
+    pipe.fit(X_train, train[args.target].astype(np.int8).values)
 
-# ---- Eğitim
-pipe.fit(X_train, y_train)
+    proba = pipe.predict_proba(X_test)[:, 1].astype(np.float32)
+    ap = float(average_precision_score(y_test, proba))
+    prec, rec, th = precision_recall_curve(y_test, proba)
+    f1s = 2 * (prec * rec) / (prec + rec + 1e-12)
+    best_idx = int(np.nanargmax(f1s))
+    best_th  = float(th[max(0, best_idx-1)] if best_idx > 0 else 0.5)
+    y_pred_best = (proba >= best_th).astype(np.int8)
+    f1_best = float(f1_score(y_test, y_pred_best))
 
-# ---- Değerlendirme
-proba = pipe.predict_proba(X_test)[:, 1].astype(np.float32)
-ap = float(average_precision_score(y_test, proba))
-prec, rec, th = precision_recall_curve(y_test, proba)
-f1s = 2 * (prec * rec) / (prec + rec + 1e-12)
-best_idx = int(np.nanargmax(f1s))
-best_th  = float(th[max(0, best_idx-1)] if best_idx > 0 else 0.5)
-y_pred_best = (proba >= best_th).astype(np.int8)
-f1_best = float(f1_score(y_test, y_pred_best))
+    print(f"[RESULT] PR-AUC: {ap:.4f} | Best-F1@{best_th:.3f} = {f1_best:.4f}")
+    print("Classification report:")
+    print(classification_report(y_test, y_pred_best, digits=4))
 
-print(f"[RESULT] PR-AUC: {ap:.4f} | Best-F1@{best_th:.3f} = {f1_best:.4f}")
-print("Classification report:")
-print(classification_report(y_test, y_pred_best, digits=4))
+    args.model_out.parent.mkdir(parents=True, exist_ok=True)
+    args.report_out.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(pipe, args.model_out)
 
-# ---- Kaydet
-OUT_DIR = Path(".")
-(OUT_DIR / "models").mkdir(exist_ok=True)
-(OUT_DIR / "reports").mkdir(exist_ok=True)
+    metrics = {
+        "data_file": str(src),
+        "time_col": time_col,
+        "n_train": int(len(train)), "n_test": int(len(test)),
+        "n_features_num": len(num_cols),
+        "n_features_cat": len(cat_cols),
+        "class_balance_train": {"pos": int(pos), "neg": int(neg), "scale_pos_weight": spw},
+        "pr_auc": ap, "f1_best": f1_best, "best_threshold": best_th,
+    }
+    with open(args.report_out, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
 
-metrics = {
-    "data_file": str(DATA_PATH),
-    "n_train": int(len(train)), "n_test": int(len(test)),
-    "n_features_num": len(num_cols),
-    "n_features_cat": len(cat_cols),
-    "pr_auc": ap, "f1_best": f1_best, "best_threshold": best_th,
-}
-with open(OUT_DIR / "reports" / ("block_metrics_8h.json" if "block_id" in df.columns else "block_metrics_1d.json"),
-          "w", encoding="utf-8") as f:
-    json.dump(metrics, f, ensure_ascii=False, indent=2)
-
-try:
-    import joblib
-    joblib.dump(pipe, OUT_DIR / "models" / ("sutam_block_8h.joblib" if "block_id" in df.columns else "sutam_block_1d.joblib"))
-except Exception as e:
-    print(f"[WARN] Model kaydı başarısız: {e}")
+if __name__ == "__main__":
+    main()
