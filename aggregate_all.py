@@ -11,7 +11,7 @@ on:
       granularity:
         description: "Hangi model(ler) eğitilsin?"
         type: choice
-        options: [hourly, 8h, 1d, all]
+        options: ["hourly", "8h", "1d", "all"]
         default: hourly
       balanced:
         description: "Saatlik modeli (yalnızca bayrak) dengele"
@@ -71,15 +71,26 @@ jobs:
 
       - name: Detect input parquet & optional files
         id: detect
+        shell: bash
         run: |
           set -euo pipefail
-          prefer_09="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_09.parquet' -print -quit)" || true
-          if [ -n "${prefer_10}" ]; then INPUT="${prefer_10}"; elif [ -n "${prefer_09}" ]; then INPUT="${prefer_09}"; exit 1; fi
+          prefer_09="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_09.parquet' -print -quit || true)"
+          prefer_10="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'fr_crime_10.parquet' -print -quit || true)"
+
+          if [ -n "${prefer_09}" ]; then
+            INPUT="${prefer_09}"
+          elif [ -n "${prefer_10}" ]; then
+            INPUT="${prefer_10}"
+          else
+            echo "❌ fr_crime_09.parquet / fr_crime_10.parquet bulunamadı."
+            exit 1
+          fi
+
           echo "input=${INPUT}" >> "$GITHUB_OUTPUT"
           echo "✅ INPUT=${INPUT}"
 
-          RH="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f \( -name 'risk_hourly.parquet' -o -name 'risky_hours.parquet' \) -print -quit)" || true
-          MET="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'metrics_stacking_ohe.parquet' -print -quit)" || true
+          RH="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f \( -name 'risk_hourly.parquet' -o -name 'risky_hours.parquet' \) -print -quit || true)"
+          MET="$(/usr/bin/find "${DATA_DIR}" -maxdepth 2 -type f -name 'metrics_stacking_ohe.parquet' -print -quit || true)"
           [ -n "${RH}" ] && echo "risky_hours=${RH}" >> "$GITHUB_OUTPUT"
           [ -n "${MET}" ] && echo "metrics=${MET}"     >> "$GITHUB_OUTPUT"
 
@@ -125,7 +136,7 @@ jobs:
       - name: Aggregate multi-windows (3H/8H/1D/1W/1M)
         run: |
           set -euo pipefail
-          echo "▶️  aggregate_all.py (${ { github.event.inputs.windows } })"
+          echo "▶️  aggregate_all.py (${{ github.event.inputs.windows }})"
           python -u aggregate_all.py \
             --input "${{ env.DATA_DIR }}/${{ env.OUT_FILE }}" \
             --freqs "${{ github.event.inputs.windows }}" \
