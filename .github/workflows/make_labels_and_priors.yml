@@ -176,21 +176,26 @@ jobs:
         if: ${{ github.event.inputs.granularity == '8h' || github.event.inputs.granularity == 'all' }}
         run: |
           set -euo pipefail
-          echo "▶️  train_block_model.py (8H)"
-          python -u train_block_model.py  # default 8H dosyasını okuyor (sf_crime_grid_8h.parquet)
+          echo "▶️  train_hourly_model.py (8H)"
+          ls -lah
+          # 8H penceresi oluşturulmuşsa (sf_crime_grid_8h.parquet)
+          python -u train_hourly_model.py \
+            --input sf_crime_grid_8h.parquet \
+            --freq 8H \
+            --tz America/Los_Angeles
 
       # ---- 1D eğitim
       - name: Train 1D model
         if: ${{ github.event.inputs.granularity == '1d' || github.event.inputs.granularity == 'all' }}
         run: |
           set -euo pipefail
-          echo "▶️  train_block_model.py (1D)"
-          # train_block_model.py içinde DATA_PATH'i CLI argümanına çevirmediysen
-          # küçük bir hack: dosyayı kopyalayıp isim verelim:
-          cp sf_crime_grid_1d.parquet sf_crime_grid_8h.parquet
-          python -u train_block_model.py
-          # ardından geri al:
-          git checkout -- sf_crime_grid_8h.parquet || true
+          echo "▶️  train_hourly_model.py (1D)"
+          ls -lah
+          # 1D versiyonu oluşturulmuşsa (sf_crime_grid_1d.parquet)
+          python -u train_hourly_model.py \
+            --input sf_crime_grid_1d.parquet \
+            --freq 1D \
+            --tz America/Los_Angeles
 
       - name: Upload artifacts (if selected)
         if: ${{ github.event.inputs.persist == 'artifact' }}
