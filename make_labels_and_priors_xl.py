@@ -124,7 +124,12 @@ def _build_full_grid(df: pd.DataFrame) -> pd.DataFrame:
 
 def _prior_rolling(df: pd.DataFrame, window: str, suffix: str,
                    keys: Tuple[str,str,str]=("day_of_week","hour","season")) -> pd.DataFrame:
+    # Güvenli sıralama
+    if "GEOID" not in df.columns or "dt" not in df.columns:
+        raise RuntimeError("prior hesaplaması için GEOID ve dt zorunlu.")
     df = df.sort_values(["GEOID","dt"]).copy()
+
+    # Grup kolonlarını garanti et
     grp_cols = ["GEOID", *[k for k in keys if k in df.columns]]
 
     def _roll(g: pd.DataFrame) -> pd.DataFrame:
@@ -132,21 +137,26 @@ def _prior_rolling(df: pd.DataFrame, window: str, suffix: str,
         cnt = g["Y_label"].rolling(window=window).sum().shift(1).fillna(0.0)
         g = g.reset_index()
         g[f"prior_cnt_{suffix}"] = cnt.to_numpy().astype("float32")
+        # Grup anahtarlarını kaybetmemek için açıkça taşı
+        for k in grp_cols:
+            if k not in g.columns and k in df.columns:
+                g[k] = g[k]
         return g
 
-    # FutureWarning fix: include_groups=False
+    # >>> KRİTİK: include_groups=True + observed=False (uyarıyı susturur)
     try:
-        # pandas ≥ 2.1: include_groups parametresi mevcut
-        out = df.groupby(grp_cols, group_keys=False).apply(_roll, include_groups=True)
+        out = df.groupby(grp_cols, group_keys=False, observed=False).apply(_roll, include_groups=True)
     except TypeError:
-        # Eski pandas sürümleri için (parametre yoksa)
-        out = df.groupby(grp_cols, group_keys=False).apply(_roll)
+        # Eski pandas için (parametre yoksa)
+        out = df.groupby(grp_cols, group_keys=False, observed=False).apply(_roll)
 
+    if "GEOID" not in out.columns:
+        raise RuntimeError("Internal: apply sonrası GEOID kayboldu; pandas sürümünü ve include_groups=True kullanımını kontrol edin.")
 
     hours_in_window = float(pd.Timedelta(window) / pd.Timedelta("1h"))
     out[f"prior_p_{suffix}"] = (out[f"prior_cnt_{suffix}"] / hours_in_window).astype("float32")
     return out
-
+                     
 def _downcast_numeric(df: pd.DataFrame, prefer_float32=True) -> pd.DataFrame:
     for c in df.select_dtypes(include=["int64","int32"]).columns:
         df[c] = pd.to_numeric(df[c], downcast="integer")
