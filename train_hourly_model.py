@@ -46,11 +46,8 @@ def parse_args():
 
 
 # ===== Sızıntı koruma =====
-FORBIDDEN_SUBSTRINGS = [
-    "y_label", "ylabel", "label",
-    "crime_count",          # aynı pencerenin olay toplamı — kesinlikle yasak
-    "hr_cnt", "daily_cnt",  # anlık sayaçlar
-]
+FORBIDDEN_SUBSTRINGS = ["y_label", "ylabel", "label", "crime_count", "hr_cnt", "daily_cnt"]
+
 PRIOR_OK_PREFIX = ("prior_cnt_", "prior_p_")  # shift(1) ile üretildiyse güvenli
 
 def assert_no_leak(cols: list[str]):
