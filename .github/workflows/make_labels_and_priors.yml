@@ -17,6 +17,15 @@ on:
         description: "Saatlik modeli (yalnızca bayrak) dengele"
         type: boolean
         default: false
+      windows:
+        description: "Multi-window frekansları (virgülle): 3H,8H,1D,1W,1M"
+        default: "3H,8H,1D,1W,1M"
+      horizon:
+        description: "Forecast ufku (örn: 72h, 30d, 12w)"
+        default: "72h"
+      topk:
+        description: "Şehir geneli Top-K GEOID"
+        default: "50"
 
 permissions:
   contents: write
@@ -98,7 +107,7 @@ jobs:
           test -s "${OUT_PQ}" || { echo "❌ Output parquet yok: ${OUT_PQ}"; exit 1; }
           [ -f "${DATA_DIR}/y_label_stats.csv" ] && { echo "Y_label stats:"; cat "${DATA_DIR}/y_label_stats.csv" || true; }
 
-      # ---- 8H / 1D agregasyon (opsiyonel)
+      # (İsteğe bağlı) klasik 8H/1D agregasyon
       - name: Aggregate to 8H and/or 1D
         if: ${{ github.event.inputs.granularity == '8h' || github.event.inputs.granularity == '1d' || github.event.inputs.granularity == 'all' }}
         run: |
@@ -113,16 +122,24 @@ jobs:
             python -u aggregate_windows.py --input "${INPUT}" --out "sf_crime_grid_1d.parquet" --freq 1D --tz America/Los_Angeles
           fi
 
-      # ---- Saatlik eğitim (tek script)
+      # Yeni: 3H/8H/1D/1W/1M agregasyon (run-time hizalı)
+      - name: Aggregate multi-windows (3H/8H/1D/1W/1M)
+        run: |
+          set -euo pipefail
+          echo "▶️  aggregate_all.py (${ { github.event.inputs.windows } })"
+          python -u aggregate_all.py \
+            --input "${{ env.DATA_DIR }}/${{ env.OUT_FILE }}" \
+            --freqs "${{ github.event.inputs.windows }}" \
+            --tz America/Los_Angeles
+
+      # Eğitimler
       - name: Train hourly model
         if: ${{ github.event.inputs.granularity == 'hourly' || github.event.inputs.granularity == 'all' }}
         run: |
           set -euo pipefail
           echo "▶️  train_hourly_model.py (balanced=${{ github.event.inputs.balanced }})"
-          # Not: balanced=True şu an yalnızca raporlama amaçlı; script tek.
           python -u train_hourly_model.py
 
-      # ---- 8H eğitim (aynı script, input parametre veriyoruz)
       - name: Train 8H model
         if: ${{ github.event.inputs.granularity == '8h' || github.event.inputs.granularity == 'all' }}
         run: |
@@ -131,7 +148,6 @@ jobs:
           echo "▶️  train_hourly_model.py (8H)"
           python -u train_hourly_model.py --input sf_crime_grid_8h.parquet --freq 8H --tz America/Los_Angeles
 
-      # ---- 1D eğitim
       - name: Train 1D model
         if: ${{ github.event.inputs.granularity == '1d' || github.event.inputs.granularity == 'all' }}
         run: |
@@ -139,6 +155,33 @@ jobs:
           test -s sf_crime_grid_1d.parquet || { echo "1D dosyası yok, eğitim atlandı."; exit 0; }
           echo "▶️  train_hourly_model.py (1D)"
           python -u train_hourly_model.py --input sf_crime_grid_1d.parquet --freq 1D --tz America/Los_Angeles
+
+      # Yeni: multi-window eğitim (freqs inputuna göre)
+      - name: Train multi-windows (3H/8H/1D/1W/1M)
+        run: |
+          set -euo pipefail
+          echo "▶️  train_multi_windows.py"
+          python -u train_multi_windows.py \
+            --dir "." \
+            --prefix "sf_crime_grid_" \
+            --freqs "${{ github.event.inputs.windows }}" \
+            --undersample "0.0"
+
+      # (Varsa) Forecast
+      - name: Run risk_forecast (multi-window predictions)
+        run: |
+          set -euo pipefail
+          if [ -f risk_forecast.py ]; then
+            echo "▶️  risk_forecast.py (freq=auto, horizon=${{ github.event.inputs.horizon }}, topk=${{ github.event.inputs.topk }})"
+            python -u risk_forecast.py \
+              --freq auto \
+              --horizon "${{ github.event.inputs.horizon }}" \
+              --topk "${{ github.event.inputs.topk }}"
+            echo "✅ Forecasts oluşturuldu:"
+            ls -lh forecasts || true
+          else
+            echo "ℹ️ risk_forecast.py bulunamadı, forecast adımı atlandı."
+          fi
 
       - name: Upload artifacts (if selected)
         if: ${{ github.event.inputs.persist == 'artifact' }}
@@ -154,6 +197,8 @@ jobs:
             models/*.joblib
             reports/*.json
             reports/*.csv
+            forecasts/*.csv
+            forecasts/*.json
           if-no-files-found: warn
           retention-days: 14
 
@@ -170,11 +215,12 @@ jobs:
           [ -f sf_crime_grid_1d.parquet ] && git add sf_crime_grid_1d.parquet || true
           git add models/*.joblib 2>/dev/null || true
           git add reports/* 2>/dev/null || true
+          git add forecasts/* 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
-          git commit -m "chore: labels+priors, (hourly/8h/1d) training & reports"
+          git commit -m "chore: labels+priors, multi-window aggregation/training & forecasts"
           git push origin "${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}"
 
       - name: Job summary
@@ -185,10 +231,14 @@ jobs:
             echo "- Input: \`${{ steps.detect.outputs.input }}\`"
             echo "- Granularity: \`${{ github.event.inputs.granularity }}\`"
             echo "- Balanced(hourly flag): \`${{ github.event.inputs.balanced }}\`"
+            echo "- Windows: \`${{ github.event.inputs.windows }}\`"
+            echo "- Forecast: horizon=\`${{ github.event.inputs.horizon }}\`, topk=\`${{ github.event.inputs.topk }}\`"
             [ -n "${{ steps.detect.outputs.risky_hours }}" ] && echo "- risky_hours: \`${{ steps.detect.outputs.risky_hours }}\`"
             [ -n "${{ steps.detect.outputs.metrics }}" ] && echo "- metrics: \`${{ steps.detect.outputs.metrics }}\`"
             echo "- Output Parquet: \`${{ env.DATA_DIR }}/${{ env.OUT_FILE }}\`"
             echo "- Output ZIP: \`${{ env.DATA_DIR }}/${{ env.OUT_ZIP }}\`"
             [ -f "${{ env.DATA_DIR }}/y_label_stats.csv" ] && { echo ""; echo "### Y_label dağılımı"; tail -n +1 "${{ env.DATA_DIR }}/y_label_stats.csv"; }
-            echo ""; ls -lh models 2>/dev/null || true; ls -lh reports 2>/dev/null || true
+            echo ""; ls -lh models 2>/dev/null || true
+            echo ""; ls -lh reports 2>/dev/null || true
+            echo ""; ls -lh forecasts 2>/dev/null || true
           } >> "$GITHUB_STEP_SUMMARY"
