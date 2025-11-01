@@ -3,7 +3,7 @@
 
 """
 risk_forecast.py  (REVIZE — yalnızca 1D / 1W / 1M)
-- Eğitim modelleri: models/sutam_{1d,1w,1m}.joblib
+- Eğitim modelleri: models/sutam_{1d,1w,1m}.joblib  veya  models/sutam_stack_{1d,1w,1m}.joblib
 - Girdi özetler:   sf_crime_grid_{1d,1w,1m}.parquet
 - Çıktı: forecasts/forecast_<freq>.csv + .json
 
@@ -29,10 +29,11 @@ except Exception as e:
 # ---- Yollar
 HERE = Path(__file__).resolve().parent
 
-MODEL_PATHS = {
-    "1D": HERE / "models" / "sutam_1d.joblib",
-    "1W": HERE / "models" / "sutam_1w.joblib",
-    "1M": HERE / "models" / "sutam_1m.joblib",
+# NOT: resolve_model_path() stacking’i önce dener.
+MODEL_PATHS_BASE = {
+    "1D": HERE / "models",
+    "1W": HERE / "models",
+    "1M": HERE / "models",
 }
 AGG_PATHS = {
     "1D": HERE / "sf_crime_grid_1d.parquet",
@@ -88,7 +89,7 @@ def build_future_index(freq: str, horizon: timedelta, start_utc: pd.Timestamp | 
             rng = rng[rng >= t0]
         return rng
     if freq == "1M":
-        steps = max(1, int(np.ceil(horizon / timedelta(days=30))))
+        steps = max(1, int(np.ceil(horizon / timedelta(days=30)))))
         vals = [t0 + i * timedelta(days=30) for i in range(steps)]
         return pd.DatetimeIndex(pd.to_datetime(vals, utc=True))
     raise ValueError(f"Bilinmeyen freq: {freq}")
@@ -131,13 +132,15 @@ def expected_input_columns(model) -> Optional[List[str]]:
         return None
     pipe = model
     if hasattr(pipe, "named_steps"):
-        pre = pipe.named_steps.get("pre")
-        if pre is None:
-            for step in pipe.named_steps.values():
-                if step.__class__.__name__ == "ColumnTransformer":
-                    pre = step; break
-        if pre is not None and pre.__class__.__name__ == "ColumnTransformer":
-            return _collect_expected_columns_from_ct(pre)
+        # İsimle yakalamayı dene
+        for key in ("pre", "preprocess", "preprocessor"):
+            pre = pipe.named_steps.get(key)
+            if pre is not None and pre.__class__.__name__ == "ColumnTransformer":
+                return _collect_expected_columns_from_ct(pre)
+        # Genel tarama (sınıf adına göre)
+        for step in pipe.named_steps.values():
+            if step.__class__.__name__ == "ColumnTransformer":
+                return _collect_expected_columns_from_ct(step)
     cols = getattr(model, "feature_names_in_", None)
     return list(cols) if cols is not None else None
 
@@ -173,7 +176,7 @@ def prepare_features(freq: str, horizon: timedelta, geoid: Optional[str]) -> tup
     if not agg_path or not agg_path.exists():
         raise SystemExit(f"Agregasyon dosyası yok: {freq} → {agg_path}")
 
-    # Priors adı (28d/180d veya 3m/12m) her iki şemaya uyumlu
+    # Priors adı (28d/180d veya 3m/12m) uyumlu
     priors_pairs = [
         ("prior_cnt_28d","prior_p_28d","prior_cnt_180d","prior_p_180d"),
         ("prior_cnt_3m","prior_p_3m","prior_cnt_12m","prior_p_12m"),
@@ -234,10 +237,29 @@ def prepare_features(freq: str, horizon: timedelta, geoid: Optional[str]) -> tup
 
     return X, agg_path.name
 
+def resolve_model_path(freq: str) -> Path:
+    """Stacking modeli varsa onu kullan, yoksa klasik modele düş."""
+    base = MODEL_PATHS_BASE[freq]
+    cand = [
+        base / f"sutam_stack_{freq.lower()}.joblib",
+        base / f"sutam_{freq.lower()}.joblib",
+    ]
+    for p in cand:
+        if p.exists():
+            return p
+    # Eski isimlerde büyük/küçük varyasyonları da tara
+    alt = [
+        base / f"sutam_stack_{freq}.joblib",
+        base / f"sutam_{freq}.joblib",
+    ]
+    for p in alt:
+        if p.exists():
+            return p
+    raise SystemExit(f"Model bulunamadı: {cand + alt}")
+
 def load_model(freq: str):
-    p = MODEL_PATHS.get(freq)
-    if not p or not p.exists():
-        raise SystemExit(f"Model yok: {p}")
+    p = resolve_model_path(freq)
+    print(f"[OK] Model yolu: {p}")
     return joblib.load(p)
 
 def score_and_rank(model, X: pd.DataFrame, topk: int | None, geoid: Optional[str]) -> pd.DataFrame:
@@ -303,8 +325,8 @@ def main():
     freq_in = (args.freq or "auto").upper().strip()
     freq = pick_freq_auto(h_str) if freq_in == "AUTO" else freq_in
 
-    if freq not in MODEL_PATHS or freq not in AGG_PATHS:
-        raise SystemExit(f"Desteklenmeyen freq: {freq} (izinli: {list(MODEL_PATHS.keys())})")
+    if freq not in MODEL_PATHS_BASE or freq not in AGG_PATHS:
+        raise SystemExit(f"Desteklenmeyen freq: {freq} (izinli: {list(AGG_PATHS.keys())})")
 
     horizon_td = parse_horizon(h_str)
     print(f"[INFO] freq={freq}  horizon={h_str}  geoid={args.geoid or 'ALL'}")
@@ -313,7 +335,6 @@ def main():
     print(f"[OK] Özellikler hazır (kaynak={src_name}) — satır={len(X):,}, GEOID={X['GEOID'].nunique():,}")
 
     mdl = load_model(freq)
-    print(f"[OK] Model yüklendi: {MODEL_PATHS[freq].name}")
 
     out = score_and_rank(mdl, X, args.topk, args.geoid)
 
