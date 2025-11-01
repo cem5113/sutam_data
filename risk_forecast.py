@@ -217,47 +217,44 @@ def expected_input_columns(model) -> Optional[List[str]]:
 
 
 def align_X_to_model(model, X: pd.DataFrame) -> Tuple[pd.DataFrame, Set[str], Set[str]]:
-    """
-    Modelin beklediği kolon setine X'i hizalar:
-      - Eksik kolonlar: eklenir (0 ile). (Bazıları için 0 doğal: count/lag/priors)
-      - Fazla kolonlar: atılır.
-      - Sıra: modele göre düzenlenir.
-    Dönüş: (X_aligned, missing, extra)
-    """
     want = expected_input_columns(model)
     if not want:
-        # Beklenen seti çıkaramadıysak, X'i olduğu gibi döndür.
+        # Beklenen set çıkarılamadıysa, en azından NaN→0 yap
+        X = X.copy()
+        for c in X.columns:
+            if not pd.api.types.is_numeric_dtype(X[c]):
+                try:
+                    X[c] = pd.to_numeric(X[c], errors="coerce")
+                except Exception:
+                    pass
+        X = X.fillna(0.0)
         return X, set(), set()
 
     have = list(X.columns)
-    want_set = set(want)
-    have_set = set(have)
-
+    want_set, have_set = set(want), set(have)
     missing = want_set - have_set
     extra   = have_set - want_set
 
-    # Eksikleri ekle (0.0 ile doldur — sayısal beklenti)
+    X = X.copy()
+    # Eksikleri ekle
     for c in sorted(missing):
         X[c] = 0.0
-
     # Fazlaları at
     if extra:
         X = X.drop(columns=sorted(extra), errors="ignore")
-
-    # Sırayı modele göre yap
+    # Sırayı modele göre ayarla
     X = X.reindex(columns=want)
 
-    # Tipleri emin ol: tüm sayısal kolonları numeric'e döndür (hata → NaN → 0)
+    # Numerik yap ve NaN→0
     for c in X.columns:
         if not pd.api.types.is_numeric_dtype(X[c]):
-            # önce kaba dönüşüm; olmazsa kategori gibi olabilir, yine de 0'a map’le
             try:
-                X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0.0)
+                X[c] = pd.to_numeric(X[c], errors="coerce")
             except Exception:
-                X[c] = 0.0
+                pass
+    X = X.fillna(0.0)
 
     return X, missing, extra
-
 
 # --------- Özellik Hazırlama ---------
 def prepare_features(freq: str, horizon: timedelta, geoid: str | None) -> tuple[pd.DataFrame, str]:
@@ -402,13 +399,19 @@ def save_outputs(df: pd.DataFrame, freq: str, outdir: Path):
     outdir.mkdir(parents=True, exist_ok=True)
     csv_p = outdir / f"forecast_{freq.lower()}.csv"
     json_p = outdir / f"forecast_{freq.lower()}.json"
+
     df_out = df.copy()
-    df_out["t0_iso"] = pd.to_datetime(df_out["t0"], utc=True).dt.strftime("%Y-%m-%d %H:%M:%SZ")
+    # t0'u JSON uyumlu ISO-8601 stringe çevir
+    df_out["t0"] = pd.to_datetime(df_out["t0"], utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    # (opsiyonel) insan-okur dostu ikinci kolon istersek:
+    # df_out["t0_iso"] = df_out["t0"]
+
     df_out.to_csv(csv_p, index=False)
     with open(json_p, "w", encoding="utf-8") as f:
         json.dump(df_out.to_dict(orient="records"), f, ensure_ascii=False, indent=2)
-    return csv_p, json_p
+        # alternatif: json.dump(..., default=str) da olurdu
 
+    return csv_p, json_p
 
 # ------------ CLI ------------
 def parse_args():
