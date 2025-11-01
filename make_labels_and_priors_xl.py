@@ -163,8 +163,20 @@ def _build_full_grid_daily(df: pd.DataFrame) -> pd.DataFrame:
 # Prior hesaplayıcı
 # ---------------------------
 def _prior_rolling(df: pd.DataFrame, time_col: str, window: str, suffix: str, keys: List[str]) -> pd.DataFrame:
+    # --- Koruyucu: zaman kolonu index'e kaçmış olabilir
+    if time_col not in df.columns and isinstance(df.index, pd.DatetimeIndex) and df.index.name == time_col:
+        df = df.reset_index()
+
+    # --- Koruyucu: Y_label yoksa, crime_count'tan yeniden üret
+    if "Y_label" not in df.columns and "crime_count" in df.columns:
+        df = df.copy()
+        df["Y_label"] = (pd.to_numeric(df["crime_count"], errors="coerce").fillna(0) > 0).astype("int8")
+
+    # --- Zorunlu kolon kontrolü
     if time_col not in df.columns or "GEOID" not in df.columns or "Y_label" not in df.columns:
         raise RuntimeError("prior için GEOID, Y_label ve time_col zorunlu.")
+
+    # --- Sıralama ve grup anahtarları
     df = df.sort_values(["GEOID", time_col]).copy()
     keys = [k for k in keys if k in df.columns]
     grp_cols = ["GEOID"] + keys
@@ -176,15 +188,19 @@ def _prior_rolling(df: pd.DataFrame, time_col: str, window: str, suffix: str, ke
         out[f"prior_cnt_{suffix}"] = cnt.to_numpy().astype("float32")
         return out.reset_index()
 
+    # --- include_groups=True: grup anahtarlarını/kolonlarını koru
     try:
-        out = df.groupby(grp_cols, group_keys=False).apply(_roll, include_groups=False)
+        out = df.groupby(grp_cols, group_keys=False).apply(_roll, include_groups=True)
     except TypeError:
+        # Eski pandas sürümleri için fallback
         out = df.groupby(grp_cols, group_keys=False).apply(_roll)
+        if not set(grp_cols).issubset(out.columns):
+            out = out.reset_index(level=range(len(grp_cols)), names=grp_cols).reset_index(drop=True)
 
     hours = float(pd.Timedelta(window) / pd.Timedelta("1h"))
     out[f"prior_p_{suffix}"] = (out[f"prior_cnt_{suffix}"] / hours).astype("float32")
     return out
-
+   
 # ---------------------------
 # Pass1: temel cc (hourly) + (daily)ye indirgeme
 # ---------------------------
