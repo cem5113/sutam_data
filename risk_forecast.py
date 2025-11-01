@@ -16,9 +16,10 @@ Kullanım:
 """
 
 from __future__ import annotations
-import argparse, json, os
+import argparse, json, os, sys, inspect
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from typing import List, Tuple, Optional, Set
 
 import numpy as np
 import pandas as pd
@@ -146,7 +147,7 @@ def add_calendar(df: pd.DataFrame, t_col: str, freq: str) -> pd.DataFrame:
     return df
 
 
-def last_known_snapshot(agg_path: Path, keys_keep: list[str]) -> pd.DataFrame:
+def last_known_snapshot(agg_path: Path, keys_keep: List[str]) -> pd.DataFrame:
     """Agregasyondan, her GEOID için son satırı al (persist özellikler için)."""
     if not agg_path.exists():
         raise FileNotFoundError(f"Girdi yok: {agg_path}")
@@ -159,31 +160,140 @@ def last_known_snapshot(agg_path: Path, keys_keep: list[str]) -> pd.DataFrame:
     return df[["GEOID"] + keys_keep].copy()
 
 
+# --------- Model → Beklenen Girdi Kolonlarını Çıkar ---------
+def _collect_expected_columns_from_ct(ct) -> List[str]:
+    """
+    ColumnTransformer içindeki kolon isimlerini topla (list veya slice vb. gelebilir).
+    Yalnızca isim listelerini (str list) kullanır; index tabanlı olanlar göz ardı edilir.
+    """
+    cols: List[str] = []
+    for name, trans, sel in getattr(ct, "transformers", []):
+        if sel is None:
+            continue
+        # Passthrough / drop'ları at
+        if trans == "drop":
+            continue
+        if isinstance(sel, list):
+            cols.extend([c for c in sel if isinstance(c, str)])
+        # slice, np.ndarray, callable vs. olabilir; isim çıkaramıyorsak geç
+    # tekrarları kaldır, sıralı koru
+    seen = set()
+    ordered = []
+    for c in cols:
+        if c not in seen:
+            ordered.append(c); seen.add(c)
+    return ordered
+
+
+def expected_input_columns(model) -> Optional[List[str]]:
+    """
+    Pipeline içinden beklenen giriş DataFrame kolon adlarını tahmin eder.
+    - Tercihen ColumnTransformer('pre' vb.) içindeki selection listelerinden çıkarır.
+    - Bulamazsa None döner (bu durumda sadece elimizdeki X ile deneriz).
+    """
+    try:
+        from sklearn.pipeline import Pipeline
+        from sklearn.compose import ColumnTransformer
+    except Exception:
+        return None
+
+    pipe = model
+    if hasattr(pipe, "named_steps"):
+        # 'pre' ismi yaygın; yoksa ilk ColumnTransformer'ı yakala
+        pre = pipe.named_steps.get("pre", None)
+        if pre is None:
+            for step in pipe.named_steps.values():
+                if step.__class__.__name__ == "ColumnTransformer":
+                    pre = step
+                    break
+        if pre is not None and pre.__class__.__name__ == "ColumnTransformer":
+            return _collect_expected_columns_from_ct(pre)
+
+    # bazen model.feature_names_in_ olabilir (doğrudan estimatorlarda)
+    cols = getattr(model, "feature_names_in_", None)
+    if cols is not None:
+        return list(cols)
+    return None
+
+
+def align_X_to_model(model, X: pd.DataFrame) -> Tuple[pd.DataFrame, Set[str], Set[str]]:
+    """
+    Modelin beklediği kolon setine X'i hizalar:
+      - Eksik kolonlar: eklenir (0 ile). (Bazıları için 0 doğal: count/lag/priors)
+      - Fazla kolonlar: atılır.
+      - Sıra: modele göre düzenlenir.
+    Dönüş: (X_aligned, missing, extra)
+    """
+    want = expected_input_columns(model)
+    if not want:
+        # Beklenen seti çıkaramadıysak, X'i olduğu gibi döndür.
+        return X, set(), set()
+
+    have = list(X.columns)
+    want_set = set(want)
+    have_set = set(have)
+
+    missing = want_set - have_set
+    extra   = have_set - want_set
+
+    # Eksikleri ekle (0.0 ile doldur — sayısal beklenti)
+    for c in sorted(missing):
+        X[c] = 0.0
+
+    # Fazlaları at
+    if extra:
+        X = X.drop(columns=sorted(extra), errors="ignore")
+
+    # Sırayı modele göre yap
+    X = X.reindex(columns=want)
+
+    # Tipleri emin ol: tüm sayısal kolonları numeric'e döndür (hata → NaN → 0)
+    for c in X.columns:
+        if not pd.api.types.is_numeric_dtype(X[c]):
+            # önce kaba dönüşüm; olmazsa kategori gibi olabilir, yine de 0'a map’le
+            try:
+                X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0.0)
+            except Exception:
+                X[c] = 0.0
+
+    return X, missing, extra
+
+
+# --------- Özellik Hazırlama ---------
 def prepare_features(freq: str, horizon: timedelta, geoid: str | None) -> tuple[pd.DataFrame, str]:
     """Gelecek pencereler için X oluştur. Priors/yan değişkenleri son bilinen değerlerle doldurur."""
     agg_path = AGG_PATHS.get(freq)
     if agg_path is None or not agg_path.exists():
         raise SystemExit(f"Geçmiş agregasyon dosyası bulunamadı: {freq} → {agg_path}")
 
-    # Son bilinen özetler (persist edilecek kolonlar)
+    # Son bilinen özetler (persist edilecek muhtemel kolonlar — minimal çekirdek listesi)
     base_numeric_maybe = [
         "crime_count",
-        "prior_cnt_28d", "prior_p_28d",
+        "prior_cnt_28d",  "prior_p_28d",
         "prior_cnt_180d", "prior_p_180d",
         # yan değişken örnekleri (varsa persist):
-        "wx_tavg", "wx_prcp", "poi_total_count", "bus_stop_count", "train_stop_count", "population",
+        "wx_tavg", "wx_prcp", "wx_tmin", "wx_tmax", "wx_temp_range",
+        "wx_is_rainy", "wx_is_hot_day",
+        "poi_total_count", "poi_count_300m", "poi_count_600m", "poi_count_900m",
+        "poi_risk_score", "poi_risk_300m", "poi_risk_600m", "poi_risk_900m",
+        "bus_stop_count", "train_stop_count",
+        "population",
+        "neighbor_crime_24h", "neighbor_crime_72h", "neighbor_crime_7d",
+        "daily_cnt", "hr_cnt",
+        "311_request_count", "911_geo_hr_last3d", "911_geo_hr_last7d",
+        "distance_to_police", "distance_to_government_building",
+        # eğitim setinde görünme ihtimali olanlar genişçe bırakıldı
     ]
 
-    # 🔧 HIZLI ŞEMA OKUMA: read_parquet(..., columns=[]).columns  (nrows desteklenmez!)
+    # Şema: hızlı kolon listesi (nrows parametresi yok — columns=[] ile deneyelim)
     try:
         present_cols = set(pd.read_parquet(agg_path, columns=[]).columns)
     except Exception:
-        # bazı okumalarda columns=[] boş dönebilir; tam okuyup sadece kolon alalım
         present_cols = set(pd.read_parquet(agg_path).columns)
 
     keep_cols = [c for c in base_numeric_maybe if c in present_cols]
+    # En azından çekirdek priors + crime_count olsun
     if not keep_cols:
-        # Hiçbiri yoksa, en azından priors ve crime_count'ı bekleyelim; yoksa sadece calendar ile ilerleriz
         keep_cols = [c for c in ["crime_count", "prior_cnt_28d", "prior_p_28d", "prior_cnt_180d", "prior_p_180d"] if c in present_cols]
 
     snap = last_known_snapshot(agg_path, keys_keep=keep_cols)
@@ -215,12 +325,16 @@ def prepare_features(freq: str, horizon: timedelta, geoid: str | None) -> tuple[
         if X[c].isna().any():
             X[c] = X[c].fillna(X[c].median())
 
-    # Model tarafının beklediği tipler
-    for c in ("day_of_week", "block_id"):
+    # Model tarafının beklediği tipler (takvim kolonları)
+    for c in ("day_of_week", "block_id", "hour_start", "month", "year"):
         if c in X.columns:
-            X[c] = pd.to_numeric(X[c], errors="ignore")
+            # future warning tetiklemeyecek şekilde dönüştür
+            try:
+                X[c] = pd.to_numeric(X[c])
+            except Exception:
+                pass
             if not pd.api.types.is_integer_dtype(X[c]):
-                X[c] = pd.to_numeric(X[c], errors="coerce").fillna(-1).astype("int8")
+                X[c] = pd.to_numeric(X[c], errors="coerce").fillna(-1).astype("int16" if c == "year" else "int8")
 
     return X, agg_path.name
 
@@ -235,11 +349,26 @@ def load_model(freq: str):
 
 
 def score_and_rank(model, X: pd.DataFrame, topk: int | None, geoid: str | None) -> pd.DataFrame:
-    # Modelin pipeline'ı (OneHot/Scaler vs.) olduğunu varsayıyoruz; GEOID/t0 çıkar
-    feat = X.drop(columns=["GEOID", "t0"], errors="ignore")
+    """
+    - X → modelin beklediği giriş kolonlarına hizalanır (eksikler eklenir, fazlalar atılır)
+    - predict_proba uygulanır
+    - geoid=None ise her t0'da top-k alınır
+    """
+    # GEOID/t0 sakla, geri kalan hizalanacak
+    meta = X[["GEOID", "t0"]].copy()
+    feat_raw = X.drop(columns=["GEOID", "t0"], errors="ignore")
+
+    feat, missing, extra = align_X_to_model(model, feat_raw)
+
+    if missing:
+        print(f"[WARN] Modelin beklediği {len(missing)} kolon X'te yoktu; 0 ile eklendi: {sorted(list(missing))[:10]}{' ...' if len(missing)>10 else ''}")
+    if extra:
+        print(f"[INFO] X içinde modele gereksiz {len(extra)} kolon vardı; çıkarıldı.")
+
+    # Tahmin
     proba = model.predict_proba(feat)[:, 1].astype(np.float32)
 
-    out = X[["GEOID", "t0"]].copy()
+    out = meta.copy()
     out["prob"] = proba
 
     # Basit beşli tier
