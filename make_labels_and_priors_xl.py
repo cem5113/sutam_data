@@ -419,8 +419,8 @@ def run(input_path: Path,
         df = pass2_merge_side_features(input_path, df, side_cols, granularity=granularity, batch=12)
 
     # 4) Priors (sızıntısız)
-   df = _prior_rolling(df, time_col=time_col, window="90D",  suffix="3m",  keys=prior_keys)
-   df = _prior_rolling(df, time_col=time_col, window="365D", suffix="12m", keys=prior_keys)
+    df = _prior_rolling(df, time_col=time_col, window="90D",  suffix="3m",  keys=prior_keys)
+    df = _prior_rolling(df, time_col=time_col, window="365D", suffix="12m", keys=prior_keys)
 
     # 5) Yaz (çıktı şeması: GEOID × t0 (UTC) + numerikler)
     df = df.sort_values(["GEOID", time_col]).reset_index(drop=True)
