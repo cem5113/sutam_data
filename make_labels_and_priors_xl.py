@@ -116,9 +116,11 @@ def _downcast_numeric(df: pd.DataFrame, prefer_float32=True) -> pd.DataFrame:
 
 def _safe_read_parquet_columns(p: Path, columns: Optional[List[str]] = None) -> pd.DataFrame:
     if columns is None:
-        return pd.read_parquet(p).loc[:, ~pd.read_parquet(p).columns.duplicated()].copy()
+        df = pd.read_parquet(p)
+        return df.loc[:, ~df.columns.duplicated()].copy()
     try:
-        return pd.read_parquet(p, columns=columns).loc[:, ~pd.read_parquet(p, columns=columns).columns.duplicated()].copy()
+        df = pd.read_parquet(p, columns=columns)
+        return df.loc[:, ~df.columns.duplicated()].copy()
     except Exception:
         try:
             import pyarrow.parquet as pq
@@ -130,11 +132,13 @@ def _safe_read_parquet_columns(p: Path, columns: Optional[List[str]] = None) -> 
                 if c in actual: resolved.append(c)
                 elif c.lower() in lower: resolved.append(lower[c.lower()])
             if not resolved:
-                return pd.read_parquet(p).loc[:, ~pd.read_parquet(p).columns.duplicated()].copy()
+                df = pd.read_parquet(p)
+                return df.loc[:, ~df.columns.duplicated()].copy()
             df = pd.read_parquet(p, columns=list(dict.fromkeys(resolved)))
             return df.loc[:, ~df.columns.duplicated()].copy()
         except Exception:
-            return pd.read_parquet(p).loc[:, ~pd.read_parquet(p).columns.duplicated()].copy()
+            df = pd.read_parquet(p)
+            return df.loc[:, ~df.columns.duplicated()].copy()
 
 # ---------------------------
 # Grid kurucular
@@ -369,11 +373,9 @@ def run(input_path: Path,
         prior_keys = ["day_of_week","hour","season"]
     else:
         # daily: base zaten GEOID×t0; full day grid kur
-        # önce geçici d0 oluşturup grid inşa edip sonra t0’a geri döneceğiz
         tmp = base.rename(columns={"t0":"d0"})
         grid = _build_full_grid_daily(tmp[["GEOID","d0","crime_count"]])
-        df = grid.merge(tmp, on=["GEOID","d0"], how="left")
-        df = df.rename(columns={"d0":"t0"})
+        df = grid.merge(tmp, on=["GEOID","d0"], how="left").rename(columns={"d0":"t0"})
         df["crime_count"] = df["crime_count"].fillna(0).astype("int32")
         df["Y_label"]     = df["Y_label"].fillna(0).astype("int8")
         df = _add_calendar(df, base_col="t0", tz=tz)
@@ -389,11 +391,7 @@ def run(input_path: Path,
     df = _prior_rolling(df, time_col=time_col, window="365D", suffix="12m", keys=prior_keys)
 
     # 5) Yaz (çıktı şeması: GEOID × t0 (UTC) + numerikler)
-    if granularity == "hourly":
-        df = df.sort_values(["GEOID","dt"]).reset_index(drop=True)
-    else:
-        df = df.sort_values(["GEOID","t0"]).reset_index(drop=True)
-
+    df = df.sort_values(["GEOID", time_col]).reset_index(drop=True)
     df = _downcast_numeric(df)
     out_parquet.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_parquet, index=False)
