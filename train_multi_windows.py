@@ -86,6 +86,17 @@ def train_one(freq: str, path: Path, model_type: str, undersample: float, out_mo
                 and pd.api.types.is_numeric_dtype(df[c])]
     cat_cols = [c for c in CAT if c in df.columns]
 
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # LEAKAGE ÖNLEME: risk_* ve metrics_* kolonlarını tamamen hariç tut
+    LEAK_PREFIXES = ("risk_", "metrics_")
+
+    def _no_leak(cols):
+        return [c for c in cols if not any(c.startswith(p) for p in LEAK_PREFIXES)]
+
+    num_cols = _no_leak(num_cols)
+    cat_cols = _no_leak(cat_cols)
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
     X_train = train[cat_cols + num_cols]
     y_train = train["Y_label"].astype(np.int8).values
     X_test  = test[cat_cols + num_cols]
