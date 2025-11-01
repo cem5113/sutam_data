@@ -2,9 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-aggregate_all.py — multi-window aggregation (calendar-day 1D, runtime-anchored others)
-Girdi  : Saatlik full-grid parquet (GEOID, dt, crime_count?, Y_label?, diğer numerikler)
+aggregate_all.py — multi-window aggregation (supports hourly *or* daily input)
+Girdi  :
+  - Saatlik full-grid parquet (GEOID, dt, crime_count?, Y_label?, diğer numerikler) ➊
+  - Günlük grid parquet (GEOID, t0, crime_count?, Y_label?, diğer numerikler)       ➋
 Çıktı  : sf_crime_grid_{3h,8h,1d,1w,1m}.parquet
+
+Notlar:
+- ➋ Günlük girdiyle **sadece 1D** üretilebilir (3H/8H/1W/1M runtime-anchored olduğundan hourly gerekir).
+- ➊ Saatlik girdide tüm frekanslar desteklenir.
 """
 
 from __future__ import annotations
@@ -21,6 +27,18 @@ TIME_COLS = {"dt", "t0", "t0_local"}
 CAL_COLS = {"year", "month", "day_of_week", "hour", "hour_start", "season", "block_id"}
 LABEL_COLS = {"Y_label"}
 PROTECTED = ID_COLS | TIME_COLS | CAL_COLS | LABEL_COLS | {"crime_count"}
+
+
+# -------------------------
+# Şema algılama
+# -------------------------
+def _detect_granularity(cols: set[str]) -> str:
+    if "dt" in cols:
+        return "hourly"
+    if "t0" in cols:
+        return "daily"
+    return "unknown"
+
 
 # -------------------------
 # Zaman yardımcıları
@@ -39,10 +57,9 @@ def _anchored_floor(series: pd.Series, freq: str, tz: Optional[str]) -> pd.Serie
     except TypeError:
         # Eski pandas için yaklaşık çözüm
         delta = (s - origin).dt.total_seconds()
-        step = pd.Timedelta(freq.lower()).total_seconds()  # ⚠️ lower()
+        step = pd.Timedelta(freq.lower()).total_seconds()
         bins = np.floor(delta / step) * step
         out = origin + pd.to_timedelta(bins, unit="s")
-        # tz durumu
         if getattr(s.dt, "tz", None) is None:
             return out.dt.tz_localize("UTC")
         return out.dt.tz_convert("UTC")
@@ -74,7 +91,7 @@ def make_t0_and_block(dt_local: pd.Series, freq: str, tz: Optional[str]) -> Tupl
         hrs_since = (_ns64(dt_local) - _ns64(day0)) / 3_600_000_000_000
         block_id = np.floor(hrs_since / 8.0).astype("int8")
     elif freq == "1D":
-        # >>> TAKVİM GÜNÜ: origin kullanmadan gün başına sabitle
+        # TAKVİM GÜNÜ
         t0_local = pd.to_datetime(dt_local).dt.floor("1D")
         block_id = None
     elif freq == "1W":
@@ -87,6 +104,7 @@ def make_t0_and_block(dt_local: pd.Series, freq: str, tz: Optional[str]) -> Tupl
         raise ValueError(f"Desteklenmeyen freq: {freq}")
     return t0_local, block_id
 
+
 # -------------------------
 # Özellik & prior yardımcıları
 # -------------------------
@@ -95,6 +113,14 @@ def add_calendar_cols(df: pd.DataFrame, t0_local_col: str) -> pd.DataFrame:
     df["month"]       = df[t0_local_col].dt.month.astype("int8")
     df["day_of_week"] = df[t0_local_col].dt.dayofweek.astype("int8")
     df["hour_start"]  = df[t0_local_col].dt.hour.astype("int8")
+    return df
+
+def add_calendar_cols_from_t0(df: pd.DataFrame, t0_col: str = "t0") -> pd.DataFrame:
+    s = pd.to_datetime(df[t0_col], utc=True)
+    df["year"]        = s.dt.year.astype("int16")
+    df["month"]       = s.dt.month.astype("int8")
+    df["day_of_week"] = s.dt.dayofweek.astype("int8")
+    df["hour_start"]  = 0  # günlükte sabit; training için tutarlı kolon
     return df
 
 def _ensure_geoid(df: pd.DataFrame) -> pd.DataFrame:
@@ -114,28 +140,22 @@ def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: list[str], t
     df: GEOID, time_col (UTC), Y_label ... içerir.
     keys: ["day_of_week", ... (opsiyonel "block_id")]
     """
-    # Zorunlu kolonlar
     if time_col not in df.columns:
         raise KeyError(f"time_col '{time_col}' bulunamadı. Kolonlar: {list(df.columns)[:20]}...")
     if "Y_label" not in df.columns:
         raise KeyError("prior_rolling için 'Y_label' zorunlu.")
     df = _ensure_geoid(df)
 
-    # Sıralama
     df = df.sort_values(["GEOID", time_col]).copy()
-
-    # Grup anahtarları
     grp_cols = ["GEOID"] + [k for k in keys if k in df.columns]
 
     def _roll(g: pd.DataFrame) -> pd.DataFrame:
         g = g.sort_values(time_col).set_index(time_col)
-        # geçmişe bakan leakage-safe roll: shift(1)
         cnt = g["Y_label"].rolling(window=window).sum().shift(1).fillna(0.0)
         g = g.reset_index()
         g[f"prior_cnt_{suffix}"] = cnt.to_numpy().astype("float32")
         return g
 
-    # pandas >=2.1: include_groups parametresi var; yoksa defaults
     try:
         out = df.groupby(grp_cols, group_keys=False).apply(_roll, include_groups=False)
     except TypeError:
@@ -145,28 +165,29 @@ def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: list[str], t
     out[f"prior_p_{suffix}"] = (out[f"prior_cnt_{suffix}"] / hours_in_window).astype("float32")
     return _ensure_geoid(out)
 
-def aggregate_one(df_hourly: pd.DataFrame, freq: str, tz: Optional[str]) -> pd.DataFrame:
-    """Tek bir frekans için toplama + etiket + priors üretir."""
-    # 0) Kimlik güvenliği
+
+# -------------------------
+# Saatlik girdiden tek-frekans agregasyon
+# -------------------------
+def aggregate_one_hourly(df_hourly: pd.DataFrame, freq: str, tz: Optional[str]) -> pd.DataFrame:
+    """Saatlik (dt) girdi → freq çıktısı (3H/8H/1D/1W/1M)."""
     df = df_hourly.copy()
     df = _ensure_geoid(df)
 
-    # 1) Zaman hazırlığı
     if "dt" not in df.columns:
         raise SystemExit("Girdi saatlik grid 'dt' kolonunu içermiyor.")
     df["dt"] = pd.to_datetime(df["dt"], utc=True, errors="coerce")
     if df["dt"].isna().all():
         raise SystemExit("'dt' çözümlenemedi (hepsi NaT).")
+
     dt_local = to_local(df["dt"], tz)
     t0_local, block_id = make_t0_and_block(dt_local, freq, tz)
 
-    # 2) Toplama
     sdf = df.copy()
     sdf["t0_local"] = t0_local
     if block_id is not None:
         sdf["block_id"] = block_id
 
-    # Numeric kolonları seçerken takvim/kimlik/label korumalı
     candidates = [c for c in sdf.columns if c not in PROTECTED]
     num_cols = [c for c in candidates if pd.api.types.is_numeric_dtype(sdf[c])]
 
@@ -180,52 +201,43 @@ def aggregate_one(df_hourly: pd.DataFrame, freq: str, tz: Optional[str]) -> pd.D
     group_keys = ["GEOID", "t0_local"] + (["block_id"] if "block_id" in sdf.columns else [])
     agg = sdf.groupby(group_keys, as_index=False).agg(agg_map)
 
-    # 3) Etiket
     if "crime_count" not in agg.columns:
         raise SystemExit("Beklenen kolon 'crime_count' yok (input saatlik gridde üretmiş olmalı).")
     agg["Y_label"] = (agg["crime_count"] > 0).astype("int8")
 
-    # 4) t0 (UTC) üret
     t0_loc = pd.to_datetime(agg["t0_local"], errors="coerce")
     if getattr(t0_loc.dt, "tz", None) is None:
         agg["t0"] = t0_loc.dt.tz_localize(tz or "UTC").dt.tz_convert("UTC")
     else:
         agg["t0"] = t0_loc.dt.tz_convert("UTC")
 
-    # 5) Takvim kolonları
     agg = add_calendar_cols(agg, "t0_local")
 
-    # 6) Çıktıda kalacak kolonlar (takvim isimlerini ÇİFTLEME!)
     keep_base = ["GEOID", "t0", "t0_local", "Y_label", "crime_count",
                  "year", "month", "day_of_week", "hour_start"]
     if "block_id" in agg.columns:
         keep_base.append("block_id")
 
-    # other_nums içinde takvim/kimlik/label varsa at
     other_nums_clean = [c for c in other_nums if c not in PROTECTED]
     keep_cols = keep_base + other_nums_clean
 
-    # Çift isimleri önlemek için görünene göre filtrele + uniq sırala
     seen, ordered = set(), []
     for c in keep_cols:
         if c in agg.columns and c not in seen:
             seen.add(c)
             ordered.append(c)
 
-    # Seç + dupe başlıkları at (emniyet kemeri)
     agg = agg.loc[:, ~agg.columns.duplicated()]
     agg = agg[ordered].copy()
     agg = _ensure_geoid(agg)
 
-    # Tip güvenliği
     for col in ("day_of_week", "block_id"):
         if col in agg.columns:
             s = agg[col]
-            if isinstance(s, pd.DataFrame):  # nadiren duplicate isim yakalanırsa
+            if isinstance(s, pd.DataFrame):
                 s = s.iloc[:, 0]
             agg[col] = pd.to_numeric(s, errors="coerce").fillna(-1).astype("int8")
 
-    # 7) Priors (leakage-safe)
     if "block_id" in agg.columns:
         season_keys = ["day_of_week", "block_id"]  # 3H/8H
     else:
@@ -234,7 +246,6 @@ def aggregate_one(df_hourly: pd.DataFrame, freq: str, tz: Optional[str]) -> pd.D
     agg = prior_rolling(agg, window="28D",  suffix="28d",  keys=season_keys, time_col="t0")
     agg = prior_rolling(agg, window="180D", suffix="180d", keys=season_keys, time_col="t0")
 
-    # 8) Sırala & temizle
     order_cols = ["GEOID", "t0"] + (["block_id"] if "block_id" in agg.columns else [])
     agg = agg.sort_values(order_cols).reset_index(drop=True)
     if "t0_local" in agg.columns:
@@ -242,15 +253,58 @@ def aggregate_one(df_hourly: pd.DataFrame, freq: str, tz: Optional[str]) -> pd.D
 
     return agg
 
+
+# -------------------------
+# Günlük girdiden 1D agregasyon
+# -------------------------
+def aggregate_from_daily(df_daily: pd.DataFrame, tz: Optional[str]) -> pd.DataFrame:
+    """
+    Günlük (GEOID×t0) girdi → 1D çıktı (takvim + 28D/180D priors).
+    df_daily beklenen kolonlar: GEOID, t0, (crime_count?), (Y_label?)
+    """
+    df = df_daily.copy()
+    df = _ensure_geoid(df)
+
+    need_any = {"GEOID", "t0"}
+    miss = need_any - set(df.columns)
+    if miss:
+        raise SystemExit(f"Günlük girdi eksik kolon(lar): {miss}")
+
+    df["t0"] = pd.to_datetime(df["t0"], utc=True, errors="coerce")
+    if df["t0"].isna().all():
+        raise SystemExit("'t0' çözümlenemedi (hepsi NaT).")
+
+    if "Y_label" not in df.columns:
+        if "crime_count" in df.columns:
+            df["Y_label"] = (pd.to_numeric(df["crime_count"], errors="coerce").fillna(0) > 0).astype("int8")
+        else:
+            raise SystemExit("Günlük girdide Y_label yoksa, crime_count da gerekli.")
+
+    df = add_calendar_cols_from_t0(df, "t0")
+
+    season_keys = ["day_of_week"]
+    df = prior_rolling(df, window="28D",  suffix="28d",  keys=season_keys, time_col="t0")
+    df = prior_rolling(df, window="180D", suffix="180d", keys=season_keys, time_col="t0")
+
+    keep = ["GEOID","t0","Y_label","crime_count",
+            "year","month","day_of_week","hour_start",
+            "prior_cnt_28d","prior_p_28d","prior_cnt_180d","prior_p_180d"]
+    keep = [c for c in keep if c in df.columns]
+    df = df.sort_values(["GEOID","t0"]).reset_index(drop=True)
+    return df[keep].copy()
+
+
 # -------------------------
 # CLI
 # -------------------------
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--input", type=Path, required=True, help="Saatlik full-grid parquet (GEOID×dt)")
+    p.add_argument("--input", type=Path, required=True,
+                   help="Saatlik full-grid parquet (GEOID×dt) veya günlük grid (GEOID×t0)")
     p.add_argument("--freqs", type=str, default="3H,8H,1D,1W,1M", help="Virgüllü liste")
     p.add_argument("--tz",    type=str, default=None, help="Yerel zaman örn. America/Los_Angeles")
     return p.parse_args()
+
 
 def main():
     args = parse_args()
@@ -258,39 +312,55 @@ def main():
     if not src.exists():
         raise SystemExit(f"Girdi yok: {src.resolve()}")
 
-    # 0) Oku + şema doğrula
-    df_h = pd.read_parquet(src)
-    # GEOID'yi garanti et (geoid -> GEOID normalize)
-    try:
-        df_h = _ensure_geoid(df_h)
-    except KeyError as e:
-        raise SystemExit(str(e))
-    need = {"dt", "GEOID"}
-    miss = need - set(df_h.columns)
-    if miss:
-        raise SystemExit(f"Eksik kolon(lar): {miss}")
+    df0 = pd.read_parquet(src)
+    df0 = _ensure_geoid(df0)
+
+    gran = _detect_granularity(set(df0.columns))
+    if gran == "unknown":
+        raise SystemExit("Girdi şeması anlaşılamadı: 'dt' (hourly) ya da 't0' (daily) beklenir.")
 
     # Eski yardımcı kolonu at
-    drop_candidates = [c for c in CAL_DROP if c in df_h.columns]
+    drop_candidates = [c for c in CAL_DROP if c in df0.columns]
     if drop_candidates:
-        df_h = df_h.drop(columns=drop_candidates)
+        df0 = df0.drop(columns=drop_candidates)
 
-    # Frekansları hazırla
     freqs: List[str] = [f.strip().upper() for f in args.freqs.split(",") if f.strip()]
     valid = {"3H", "8H", "1D", "1W", "1M"}
     bad = [f for f in freqs if f not in valid]
     if bad:
         raise SystemExit(f"Geçersiz frekans(lar): {bad} | izinli: {sorted(valid)}")
 
-    for f in freqs:
-        print(f"▶️  Aggregate {f}")
-        out_path = Path(f"sf_crime_grid_{f.lower()}.parquet")
-        agg = aggregate_one(df_h, f, args.tz)
+    if gran == "daily":
+        # Günlük girdide yalnız 1D
+        if any(f for f in freqs if f != "1D"):
+            others = [f for f in freqs if f != "1D"]
+            raise SystemExit(f"Günlük (t0) girdiyle {others} üretilemez. Lütfen --freqs '1D' kullanın.")
+        print("▶️  Aggregate 1D (daily input)")
+        out_path = Path("sf_crime_grid_1d.parquet")
+        agg = aggregate_from_daily(df0, args.tz)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         agg.to_parquet(out_path, index=False)
         y_rate = float(agg["Y_label"].mean())
         print(f"[OK] {out_path}  rows={len(agg):,}  GEOID={agg['GEOID'].nunique():,}  y1%≈{100*y_rate:.4f}")
         print(f"[INFO] t0 UTC range: {agg['t0'].min()} → {agg['t0'].max()}")
+        return
+
+    # Hourly: tüm frekanslar desteklenir
+    need = {"dt", "GEOID"}
+    miss = need - set(df0.columns)
+    if miss:
+        raise SystemExit(f"Eksik kolon(lar): {miss}")
+
+    for f in freqs:
+        print(f"▶️  Aggregate {f}")
+        out_path = Path(f"sf_crime_grid_{f.lower()}.parquet")
+        agg = aggregate_one_hourly(df0, f, args.tz)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        agg.to_parquet(out_path, index=False)
+        y_rate = float(agg["Y_label"].mean())
+        print(f"[OK] {out_path}  rows={len(agg):,}  GEOID={agg['GEOID'].nunique():,}  y1%≈{100*y_rate:.4f}")
+        print(f"[INFO] t0 UTC range: {agg['t0'].min()} → {agg['t0'].max()}")
+
 
 if __name__ == "__main__":
     main()
