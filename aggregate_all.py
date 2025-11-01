@@ -47,43 +47,68 @@ def _add_calendar_from_t0(df: pd.DataFrame) -> pd.DataFrame:
     df["hour_start"]  = np.int8(0)
     return df
 
-def prior_rolling(
-    df: pd.DataFrame,
-    window: str,
-    suffix: str,
-    keys: Sequence[str],
-    time_col: str = "t0",
-) -> pd.DataFrame:
+def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: list[str], time_col: str = "t0") -> pd.DataFrame:
     """
-    df: GEOID, time_col (UTC), Y_label içerir.
+    df: GEOID, time_col (UTC), Y_label ... içerir.
     keys: ["day_of_week", ...]
+    Sızıntısız: shift(1)
     """
-    if time_col not in df.columns:
-        raise SystemExit(f"prior_rolling: '{time_col}' kolonu yok.")
-    if "Y_label" not in df.columns:
-        raise SystemExit("prior_rolling: 'Y_label' kolonu yok.")
-    df = _ensure_geoid(df).copy()
+    need = {"GEOID", time_col, "Y_label"}
+    miss = need - set(df.columns)
+    if miss:
+        raise SystemExit(f"prior_rolling için eksik kolon(lar): {miss}")
+
+    df = df.copy()
+    df["GEOID"] = df["GEOID"].astype(str)
+    keys = [k for k in (keys or []) if k in df.columns]
+
+    # Sıralama
     df = df.sort_values(["GEOID", time_col])
 
-    keys = [k for k in keys if k in df.columns]
-    grp_cols = ["GEOID"] + keys
-
-    hours_in_window = float(pd.Timedelta(window) / pd.Timedelta("1h"))
+    grp_cols = ["GEOID", *keys]
 
     def _roll(g: pd.DataFrame) -> pd.DataFrame:
-        g = g.sort_values(time_col).copy()
-        s = g.set_index(time_col)["Y_label"].rolling(window=window).sum().shift(1).fillna(0.0)
-        g[f"prior_cnt_{suffix}"] = s.to_numpy().astype("float32")
-        g[f"prior_p_{suffix}"]   = (g[f"prior_cnt_{suffix}"] / hours_in_window).astype("float32")
-        return g
+        g = g.sort_values(time_col).set_index(time_col)
+        cnt = g["Y_label"].rolling(window=window).sum().shift(1).fillna(0.0)
+        out = g.copy()
+        out[f"prior_cnt_{suffix}"] = cnt.astype("float32").to_numpy()
+        return out
 
-    # group_keys=False → gruplayıp geri birleştir, kolonları koru
+    # Grup uygula (grup anahtarlarını index’ten SÜREKLİ geri al)
     try:
-        out = df.groupby(grp_cols, group_keys=False).apply(_roll, include_groups=False)
+        tmp = df.groupby(grp_cols, group_keys=True).apply(_roll, include_groups=False)
     except TypeError:
-        out = df.groupby(grp_cols, group_keys=False).apply(_roll)
+        # Eski pandas: include_groups yok → default davranış
+        tmp = df.groupby(grp_cols, group_keys=True).apply(_roll)
 
-    return out
+    # Grup anahtarlarını tekrar sütuna çıkar
+    if isinstance(tmp.index, pd.MultiIndex):
+        # son seviye time_col (index), ilk N seviye grup anahtarları
+        # reset_index ile hepsini kolona indiriyoruz
+        tmp = tmp.reset_index()  # -> cols: grp_cols..., time_col
+        # Güvenlik: isimler beklediğimiz gibi değilse yeniden adlandır
+        if time_col not in tmp.columns:
+            # reset_index gerekirse farklı isim vermiş olabilir
+            # ama normalde burada time_col yerinde olacak
+            pass
+    else:
+        # Tek anahtar + time_col index olabilir
+        # Eğer time_col index’te ise indir:
+        if tmp.index.name == time_col:
+            tmp = tmp.reset_index()
+        # GEOID kolonu yoksa index grup anahtarıdır
+        if "GEOID" not in tmp.columns and tmp.index.name == "GEOID":
+            tmp = tmp.reset_index()
+
+    # Saat penceresi
+    hours_in_window = float(pd.Timedelta(window) / pd.Timedelta("1h"))
+    tmp[f"prior_p_{suffix}"] = (tmp[f"prior_cnt_{suffix}"] / hours_in_window).astype("float32")
+
+    # Tip düzeltmeleri
+    tmp["GEOID"] = tmp["GEOID"].astype(str)
+    tmp[time_col] = pd.to_datetime(tmp[time_col], utc=True)
+
+    return tmp
 
 def _normalize_1d(df: pd.DataFrame) -> pd.DataFrame:
     """
