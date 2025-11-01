@@ -163,42 +163,58 @@ def _build_full_grid_daily(df: pd.DataFrame) -> pd.DataFrame:
 # Prior hesaplayıcı
 # ---------------------------
 def _prior_rolling(df: pd.DataFrame, time_col: str, window: str, suffix: str, keys: List[str]) -> pd.DataFrame:
-    # --- Koruyucu: zaman kolonu index'e kaçmış olabilir
-    if time_col not in df.columns and isinstance(df.index, pd.DatetimeIndex) and df.index.name == time_col:
-        df = df.reset_index()
+    """
+    Sızıntısız prior:
+      - rolling(..., closed='left')  → mevcut t0/dt pencereye girmez
+      - prior_cnt_* = penceredeki Y_label toplamı
+      - prior_p_*   = prior_cnt_* / penceredeki gözlem sayısı (daily→gün, hourly→saat)
+    """
+    # Zorunlu kolonlar
+    if time_col not in df.columns:
+        raise RuntimeError(f"prior: '{time_col}' kolonu yok.")
+    if "GEOID" not in df.columns:
+        raise RuntimeError("prior: 'GEOID' kolonu yok.")
+    if "Y_label" not in df.columns:
+        # Koruyucu: yoksa crime_count'tan türet
+        if "crime_count" in df.columns:
+            df = df.copy()
+            df["Y_label"] = (pd.to_numeric(df["crime_count"], errors="coerce").fillna(0) > 0).astype("int8")
+        else:
+            raise RuntimeError("prior: 'Y_label' (veya crime_count) yok.")
 
-    # --- Koruyucu: Y_label yoksa, crime_count'tan yeniden üret
-    if "Y_label" not in df.columns and "crime_count" in df.columns:
-        df = df.copy()
-        df["Y_label"] = (pd.to_numeric(df["crime_count"], errors="coerce").fillna(0) > 0).astype("int8")
+    # Hazırlık
+    df = df.copy()
+    df["GEOID"] = df["GEOID"].astype(str)
+    df[time_col] = pd.to_datetime(df[time_col], utc=True)
+    df = df.sort_values(["GEOID", time_col])
 
-    # --- Zorunlu kolon kontrolü
-    if time_col not in df.columns or "GEOID" not in df.columns or "Y_label" not in df.columns:
-        raise RuntimeError("prior için GEOID, Y_label ve time_col zorunlu.")
-
-    # --- Sıralama ve grup anahtarları
-    df = df.sort_values(["GEOID", time_col]).copy()
-    keys = [k for k in keys if k in df.columns]
-    grp_cols = ["GEOID"] + keys
+    keys = [k for k in (keys or []) if k in df.columns]
+    grp_cols = ["GEOID", *keys]
 
     def _roll(g: pd.DataFrame) -> pd.DataFrame:
         g = g.sort_values(time_col).set_index(time_col)
-        cnt = g["Y_label"].rolling(window=window).sum().shift(1).fillna(0.0)
+        y = pd.to_numeric(g["Y_label"], errors="coerce").fillna(0.0)
+
+        # BUGÜN HARİÇ → closed='left'
+        cnt = y.rolling(window=window, closed="left").sum()
+        obs = y.rolling(window=window, closed="left").count()
+        p   = cnt / obs.replace(0, np.nan)
+
         out = g.copy()
-        out[f"prior_cnt_{suffix}"] = cnt.to_numpy().astype("float32")
+        out[f"prior_cnt_{suffix}"] = cnt.astype("float32").to_numpy()
+        out[f"prior_p_{suffix}"]   = p.astype("float32").to_numpy()
         return out.reset_index()
 
-    # --- include_groups=True: grup anahtarlarını/kolonlarını koru
+    # pandas >=2.2: include_groups paramı var; yoksa fallback
     try:
-        out = df.groupby(grp_cols, group_keys=False).apply(_roll, include_groups=True)
+        out = df.groupby(grp_cols, group_keys=False).apply(_roll, include_groups=False)
     except TypeError:
-        # Eski pandas sürümleri için fallback
         out = df.groupby(grp_cols, group_keys=False).apply(_roll)
-        if not set(grp_cols).issubset(out.columns):
-            out = out.reset_index(level=range(len(grp_cols)), names=grp_cols).reset_index(drop=True)
 
-    hours = float(pd.Timedelta(window) / pd.Timedelta("1h"))
-    out[f"prior_p_{suffix}"] = (out[f"prior_cnt_{suffix}"] / hours).astype("float32")
+    # Başlangıç dönemindeki NaN oranları 0’a çek
+    out[f"prior_cnt_{suffix}"] = out[f"prior_cnt_{suffix}"].fillna(0.0).astype("float32")
+    out[f"prior_p_{suffix}"]   = out[f"prior_p_{suffix}"].fillna(0.0).astype("float32")
+
     return out
    
 # ---------------------------
@@ -403,8 +419,8 @@ def run(input_path: Path,
         df = pass2_merge_side_features(input_path, df, side_cols, granularity=granularity, batch=12)
 
     # 4) Priors (sızıntısız)
-    df = _prior_rolling(df, time_col=time_col, window="90D",  suffix="3m",  keys=prior_keys)
-    df = _prior_rolling(df, time_col=time_col, window="365D", suffix="12m", keys=prior_keys)
+   df = _prior_rolling(df, time_col=time_col, window="90D",  suffix="3m",  keys=prior_keys)
+   df = _prior_rolling(df, time_col=time_col, window="365D", suffix="12m", keys=prior_keys)
 
     # 5) Yaz (çıktı şeması: GEOID × t0 (UTC) + numerikler)
     df = df.sort_values(["GEOID", time_col]).reset_index(drop=True)
