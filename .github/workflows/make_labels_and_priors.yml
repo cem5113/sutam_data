@@ -38,7 +38,9 @@ jobs:
           lfs: true
 
       - name: Show workspace
+        shell: bash
         run: |
+          set -euo pipefail
           echo "PWD=$(pwd)"
           ls -lah
 
@@ -50,6 +52,7 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Install dependencies (pinned)
+        shell: bash
         run: |
           set -euo pipefail
           python -m pip install -U pip
@@ -67,6 +70,15 @@ jobs:
               "imbalanced-learn>=0.12,<0.13" \
               joblib matplotlib tqdm
           fi
+          python - <<'PY'
+          import sys, pandas, sklearn, xgboost, lightgbm
+          print("VERSIONS:",
+                "py", sys.version.split()[0],
+                "pandas", pandas.__version__,
+                "sklearn", sklearn.__version__,
+                "xgb", xgboost.__version__,
+                "lgbm", lightgbm.__version__)
+          PY
 
       - name: Detect input parquet & optional files
         id: detect
@@ -135,7 +147,7 @@ jobs:
           FREQS="$(IFS=,; echo "${SEL[*]}")"
           echo "→ Kullanılacak frekanslar: ${FREQS}"
 
-          # DİKKAT: --tz parametresi yok
+          # aggregate_all.py --tz PARAMETRESİ YOK
           python -u aggregate_all.py \
             --input "${{ env.DATA_DIR }}/${{ env.OUT_FILE }}" \
             --freqs "${FREQS}"
@@ -147,7 +159,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "▶️  train_multi_windows.py"
-          # Eğitim frekanslarını aynı şekilde 1D/1W/1M ile sınırla
+          # Eğitim frekanslarını aynı whitelist ile sınırla
           RAW="${{ github.event.inputs.windows }}"
           RAW="${RAW// /}"
           ALLOWED=("1D" "1W" "1M")
@@ -177,7 +189,7 @@ jobs:
           set -euo pipefail
           if [ -f risk_forecast.py ]; then
             echo "▶️  risk_forecast.py (freq=1D, horizon=${{ github.event.inputs.horizon }}, topk=${{ github.event.inputs.topk }})"
-            # Otomatik seçim 3H'e düşebileceği için 1D'e sabitliyoruz
+            # Otomatik seçim 3H'e düşmesin diye 1D'e sabitliyoruz
             python -u risk_forecast.py \
               --freq 1D \
               --horizon "${{ github.event.inputs.horizon }}" \
@@ -233,7 +245,7 @@ jobs:
           {
             echo "## Make Labels + Train — Özet"
             echo "- Input: \`${{ steps.detect.outputs.input }}\`"
-            echo "- Windows: \`${{ github.event.inputs.windows }}\`"
+            echo "- Windows (raw): \`${{ github.event.inputs.windows }}\`"
             echo "- Forecast: horizon=\`${{ github.event.inputs.horizon }}\`, topk=\`${{ github.event.inputs.topk }}\`"
             [ -n "${{ steps.detect.outputs.risky_hours }}" ] && echo "- risky_hours: \`${{ steps.detect.outputs.risky_hours }}\`"
             [ -n "${{ steps.detect.outputs.metrics }}" ] && echo "- metrics: \`${{ steps.detect.outputs.metrics }}\`"
