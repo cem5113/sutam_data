@@ -92,23 +92,32 @@ def add_calendar_cols(df: pd.DataFrame, t0_local_col: str) -> pd.DataFrame:
     df["hour_start"]  = df[t0_local_col].dt.hour.astype("int8")
     return df
 
-def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: List[str]) -> pd.DataFrame:
-    """Leakage-safe prior: Y_label rolling SUM, shift(1)."""
-    df = df.sort_values(["GEOID", "t0"]).copy()
-    keys = [k for k in keys if k in df.columns]
-    grp_cols = ["GEOID"] + keys
+def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: list[str], time_col: str = "t0") -> pd.DataFrame:
+    """
+    df: GEOID, time_col (UTC), Y_label ... içerir.
+    keys: ["day_of_week", ... (opsiyonel "block_id")]
+    """
+    if time_col not in df.columns:
+        raise KeyError(f"time_col '{time_col}' bulunamadı. Mevcut kolonlar: {list(df.columns)[:20]}")
+
+    # Sıralama
+    df = df.sort_values(["GEOID", time_col]).copy()
+
+    # Grup anahtarları
+    grp_cols = ["GEOID"] + [k for k in keys if k in df.columns]
 
     def _roll(g: pd.DataFrame) -> pd.DataFrame:
-        g = g.sort_values("t0").set_index("t0")
+        g = g.sort_values(time_col).set_index(time_col)
+        # geçmişe bakan leakage-safe roll: shift(1)
         cnt = g["Y_label"].rolling(window=window).sum().shift(1).fillna(0.0)
-        out = g.copy()
-        out[f"prior_cnt_{suffix}"] = cnt.to_numpy().astype("float32")
-        return out.reset_index()
+        g = g.reset_index()
+        g[f"prior_cnt_{suffix}"] = cnt.to_numpy().astype("float32")
+        return g
 
-    df = df.sort_values(['GEOID','t'])       
-    df['crime_event'] = df['crime_event'].shift(1)  
-    out = df.groupby(grp_cols, group_keys=False).apply(_roll)
-    hours_in_window = float(pd.Timedelta(window.lower()) / pd.Timedelta("1h"))  # ⚠️ lower()
+    # FutureWarning fix: include_groups=False
+    out = df.groupby(grp_cols, group_keys=False).apply(_roll, include_groups=False)
+
+    hours_in_window = float(pd.Timedelta(window) / pd.Timedelta("1h"))
     out[f"prior_p_{suffix}"] = (out[f"prior_cnt_{suffix}"] / hours_in_window).astype("float32")
     return out
 
