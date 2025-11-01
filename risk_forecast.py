@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-risk_forecast.py  (REVIZE — 1D-öncelikli, priors adı uyumlu)
+risk_forecast.py  (REVIZE — 1D-öncelikli, sağlam horizon parse, priors adı uyumlu)
 - Çoklu pencere (3H, 8H, 1D, 1W, 1M) için ileri tarih tahmini
 - Eğitimden çıkan modelleri (models/sutam_{3h,8h,1d,1w,1m}.joblib) kullanır
 - Girdi: geçmiş agregasyonlar (sf_crime_grid_{3h,8h,1d,1w,1m}.parquet)
@@ -14,7 +14,7 @@ Kullanım:
 """
 
 from __future__ import annotations
-import argparse, json
+import argparse, json, re
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import List, Tuple, Optional, Set
@@ -50,25 +50,51 @@ FREQ_TO_PANDAS = {"3H":"3h","8H":"8h","1D":"1d","1W":"7d","1M":None}
 def now_utc() -> pd.Timestamp:
     return pd.Timestamp(datetime.now(timezone.utc))
 
+# Toleranslı horizon parse
+_HORIZON_RX = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*([hdwmHDWM]?)\s*$")
+
+def _parse_horizon_hours(horizon_str: str) -> float:
+    """
+    Ufku saat cinsinden döndürür.
+    Kabul: '72h', '30D', '8w', '1m', '  24h ', '72', '72 H'
+    Birim verilmezse saat varsayılır.
+    """
+    if not horizon_str:
+        return 72.0
+    s = (horizon_str or "").strip().replace("\u00A0", " ").lower()
+    m = _HORIZON_RX.match(s)
+    if m:
+        val = float(m.group(1))
+        unit = (m.group(2) or "h").lower()
+        if unit == "h": return val
+        if unit == "d": return val * 24.0
+        if unit == "w": return val * 24.0 * 7.0
+        if unit == "m": return val * 24.0 * 30.0  # yaklaşık ay
+    # Pandas fallback
+    try:
+        td = pd.to_timedelta(s)
+        return float(td / pd.Timedelta(hours=1))
+    except Exception:
+        try:
+            return float(s)  # "72" → saat
+        except Exception:
+            raise ValueError("horizon biçimi: 24h, 72h, 14d, 8w, 1m ...")
+
 def pick_freq_auto(h: str) -> str:
-    s = h.lower().strip()
-    if   s.endswith("1h"): hours = float(s[:-1])
-    elif s.endswith("d"): hours = float(s[:-1]) * 24
-    elif s.endswith("w"): hours = float(s[:-1]) * 24 * 7
-    elif s.endswith("m"): hours = float(s[:-1]) * 24 * 30
-    else: raise ValueError("horizon biçimi: 24h, 14d, 8w, 1m ...")
-    if hours <= 72:                 return "3H"
-    if hours <= 24 * 30:            return "1D"   # 1D-öncelikli
-    if hours <= 24 * 90:            return "1W"
+    """
+    - ≤72h → 3H
+    - ≤30d → 1D (1D-öncelikli)
+    - ≤90d → 1W
+    - >90d → 1M
+    """
+    hours = _parse_horizon_hours(h)
+    if hours <= 72:              return "3H"
+    if hours <= 24 * 30:         return "1D"
+    if hours <= 24 * 90:         return "1W"
     return "1M"
 
 def parse_horizon(h: str) -> timedelta:
-    s = h.lower().strip()
-    if   s.endswith("1h"): return timedelta(hours=float(s[:-1]))
-    if   s.endswith("d"): return timedelta(days=float(s[:-1]))
-    if   s.endswith("w"): return timedelta(weeks=float(s[:-1]))
-    if   s.endswith("m"): return timedelta(days=float(s[:-1]) * 30)
-    raise ValueError("horizon biçimi: 24h, 10d, 8w, 1m ...")
+    return timedelta(hours=_parse_horizon_hours(h))
 
 def block_id_for_hour(h: int, freq: str) -> int:
     if freq == "8H": return int(h // 8)
@@ -79,12 +105,14 @@ def build_future_index(freq: str, horizon: timedelta, start_utc: pd.Timestamp | 
     t0 = start_utc.tz_convert("UTC") if isinstance(start_utc, pd.Timestamp) else now_utc()
     if freq in ("3H","8H","1D","1W"):
         pd_freq = FREQ_TO_PANDAS[freq]
-        # 1D ve 1W için gün/hafta başına hizalama (runtime-anchored)
+        # 1D ve 1W: gün başına hizala (runtime-anchored)
         if freq in ("1D","1W"):
             t0 = t0.floor("D")
         end = t0 + horizon
-        rng = pd.date_range(t0, end, freq=pd_freq, tz="UTC", inclusive="left")
-        return rng[rng >= t0]
+        rng = pd.date_range(t0.floor("s"), end.ceil("s"), freq=pd_freq, tz="UTC", inclusive="left")
+        if len(rng) and rng[0] < t0:
+            rng = rng[rng >= t0]
+        return rng
     if freq == "1M":
         steps = max(1, int(np.ceil(horizon / timedelta(days=30))))
         vals = [t0 + i * timedelta(days=30) for i in range(steps)]
@@ -127,7 +155,7 @@ def _collect_expected_columns_from_ct(ct) -> List[str]:
 
 def expected_input_columns(model) -> Optional[List[str]]:
     try:
-        from sklearn.compose import ColumnTransformer
+        from sklearn.compose import ColumnTransformer  # noqa: F401
     except Exception:
         return None
     pipe = model
@@ -306,14 +334,18 @@ def parse_args():
 
 def main():
     args = parse_args()
-    freq = args.freq.upper().strip()
-    if freq == "AUTO":
-        freq = pick_freq_auto(args.horizon)
+    h_str = (args.horizon or "30d").strip()
+    freq_in = (args.freq or "auto").upper().strip()
+    if freq_in == "AUTO":
+        freq = pick_freq_auto(h_str)
+    else:
+        freq = freq_in
+
     if freq not in MODEL_PATHS or freq not in AGG_PATHS:
         raise SystemExit(f"Desteklenmeyen freq: {freq} (izinli: {list(MODEL_PATHS.keys())})")
 
-    horizon_td = parse_horizon(args.horizon)
-    print(f"[INFO] freq={freq}  horizon={args.horizon}  geoid={args.geoid or 'ALL'}")
+    horizon_td = parse_horizon(h_str)
+    print(f"[INFO] freq={freq}  horizon={h_str}  geoid={args.geoid or 'ALL'}")
 
     X, src_name = prepare_features(freq, horizon_td, args.geoid)
     print(f"[OK] Özellikler hazır (kaynak={src_name}) — satır={len(X):,}, GEOID={X['GEOID'].nunique():,}")
