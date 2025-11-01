@@ -2,18 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-train_hourly_model.py
-- Saatlik full-grid (sf_crime_grid_full_labeled.parquet) veya aggregate (8H/1D) dosyası ile eğitim
-- Zaman bazlı split (son %20 test), sızıntı korumalı
+train_hourly_model.py  (REVIZE — Gunluk/1D odaklı, sızıntı-güvenli)
+- Girdi: 1D aggregate parquet (örn. sf_crime_grid_1d.parquet) veya full-grid'ten 1D'ye indirgenmiş veri
+- Split: zaman bazlı (son %20 test) — leakage yok
 - Dengesizlik: scale_pos_weight (otomatik) + opsiyonel negatif undersample
-- CLI:
-    --input <parquet>                   : Girdi dosyası (default: sf_crime_grid_full_labeled.parquet)
-    --target Y_label                    : Hedef kolon (default)
-    --freq {hourly,8H,1D}               : Veri frekansı (default: hourly)
-    --tz America/Los_Angeles            : Bilgi amaçlı (log), zorunlu değil
-    --undersample 0.30                  : Negatif sınıfta kırpma oranı (0=kapalı)
-    --model-out models/..joblib         : Çıktı model dosyası (default freq’e göre isimlenir)
-    --report-out reports/..json         : Metrik çıktısı (default freq’e göre isimlenir)
 """
 
 from __future__ import annotations
@@ -31,24 +23,24 @@ from sklearn.impute import SimpleImputer
 from xgboost import XGBClassifier
 import joblib
 
-
 # ===== CLI =====
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--input", type=Path, default=Path("sf_crime_grid_full_labeled.parquet"))
+    p.add_argument("--input", type=Path, default=Path("sf_crime_grid_1d.parquet"))
     p.add_argument("--target", type=str, default="Y_label")
-    p.add_argument("--freq", type=str, choices=["hourly", "8H", "1D"], default="hourly")
+    # 1D'ye kilitliyoruz ki yanlışlıkla saatlik/8H seçilmesin
+    p.add_argument("--freq", type=str, choices=["1D"], default="1D")
     p.add_argument("--tz", type=str, default=None)
-    p.add_argument("--undersample", type=float, default=0.0, help="Negatif sınıf kırpma oranı [0-0.9] (0=kapalı)")
+    p.add_argument("--undersample", type=float, default=0.0,
+                  help="Train set'te negatif sınıfı KORUMA oranı (0=kapalı; 0.7 -> negatiflerin %%70'i tutulur)")
     p.add_argument("--model-out", type=Path, default=None)
     p.add_argument("--report-out", type=Path, default=None)
     return p.parse_args()
 
-
 # ===== Sızıntı koruma =====
 FORBIDDEN_SUBSTRINGS = ["y_label", "ylabel", "label", "crime_count", "hr_cnt", "daily_cnt"]
-
-PRIOR_OK_PREFIX = ("prior_cnt_", "prior_p_")  # shift(1) ile üretildiyse güvenli
+ALWAYS_EXCLUDE_PREFIXES = ("risk_", "metrics_")  # kesinlikle özellik dışı
+PRIOR_OK_PREFIX = ("prior_cnt_", "prior_p_")     # shift(1) ile üretildiyse güvenli
 
 def assert_no_leak(cols: list[str]):
     low = [c.lower() for c in cols]
@@ -59,83 +51,85 @@ def assert_no_leak(cols: list[str]):
     if offenders:
         raise SystemExit("❌ Potansiyel sızıntı: feature set içinde yasak kolon(lar): "
                          + ", ".join(sorted(set(offenders))))
+    # Bilgilendirme: Priors
     priors = [c for c in cols if c.startswith(PRIOR_OK_PREFIX)]
     if priors:
         print(f"[INFO] Priors (izinli): {sorted(priors)[:10]}{' ...' if len(priors)>10 else ''}")
 
+# ===== Yardımcılar =====
+def _pick_time_col(df: pd.DataFrame) -> str:
+    if "t0" in df.columns: return "t0"
+    if "dt" in df.columns: return "dt"
+    raise SystemExit("Zaman kolonu bulunamadı (t0 / dt).")
 
 # ===== Ana =====
 def main():
     args = parse_args()
 
-    # Varsayılan çıktı yollarını freq’e göre kur
+    # Varsayılan çıktı yolları
     if args.model_out is None:
-        args.model_out = Path(f"models/sutam_{args.freq}.joblib")
+        args.model_out = Path("models/sutam_1d.joblib")
     if args.report_out is None:
-        args.report_out = Path(f"reports/metrics_{args.freq}.json")
+        args.report_out = Path("reports/metrics_1d.json")
 
+    # Girdi
     src = args.input
     if not src.exists():
         raise SystemExit(f"Girdi yok: {src.resolve()}")
-
     df = pd.read_parquet(src)
 
-    # Zaman kolonu: blok veride t0, hourly’de dt
-    time_col = "t0" if "t0" in df.columns else ("dt" if "dt" in df.columns else None)
-    if time_col is None:
-        raise SystemExit("Zaman kolonu bulunamadı (dt / t0).")
-
-    # Temel kontroller
+    # Zaman kolonu ve kontroller
+    time_col = _pick_time_col(df)
     need = {"GEOID", time_col, args.target}
     miss = need - set(df.columns)
     if miss:
         raise SystemExit(f"Gerekli kolon(lar) eksik: {miss}")
 
-    # Sıralama (leakage-safe split)
+    # Zaman sırası (leakage-safe split için)
     df[time_col] = pd.to_datetime(df[time_col], utc=True, errors="coerce")
     df = df.sort_values(time_col).reset_index(drop=True)
 
-    # Özellik seçimi
-    drop_cols = {"GEOID", time_col, args.target, "dt_local"}
-    cat_candidates = ["year", "month", "day_of_week", "hour", "block_id"]
-    # freq’e göre mantıklı kategorikler
-    cat_cols = []
-    for c in cat_candidates:
-        if c in df.columns:
-            if args.freq == "hourly" and c in ("hour", "year", "month", "day_of_week"):
-                cat_cols.append(c)
-            elif args.freq in ("8H", "1D"):
-                # 8H ise block_id olabilir; 1D’de genelde yok ama varsa alabiliriz
-                if c in ("year", "month", "day_of_week", "block_id"):
-                    cat_cols.append(c)
+    # Özellik seçimi (1D)
+    drop_cols = {"GEOID", time_col, args.target, "dt_local",
+                 # güvenli olsun diye sayaç isimlerini de drop'a al
+                 "crime_count", "hr_cnt", "daily_cnt"}
+    cat_candidates = ["year", "month", "day_of_week", "block_id"]  # 1D'de block_id genelde yok; varsa alırız
+    cat_cols = [c for c in cat_candidates if c in df.columns]
 
-    num_cols = [c for c in df.columns
-                if (c not in drop_cols)
-                and (c not in cat_cols)
-                and pd.api.types.is_numeric_dtype(df[c])]
+    # numerikleri seçerken risk_/metrics_ öneklerini tamamen hariç tut
+    num_cols = []
+    for c in df.columns:
+        if c in drop_cols or c in cat_cols:
+            continue
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            continue
+        cl = c.lower()
+        if cl.startswith(ALWAYS_EXCLUDE_PREFIXES):
+            continue
+        num_cols.append(c)
 
     feat_cols = cat_cols + num_cols
     if not feat_cols:
-        raise SystemExit("Kullanılabilir feature bulunamadı.")
+        raise SystemExit("Kullanılabilir feature bulunamadı (sızıntı dışı).")
 
-    # Sızıntı muhafazası
+    # Son kontrol: sızıntı yasaklı ifadeler var mı?
     assert_no_leak(feat_cols)
 
     # Zaman bazlı split
     cut = int(len(df) * 0.80)
     train, test = df.iloc[:cut].copy(), df.iloc[cut:].copy()
 
-    # Dengesizlik bilgisi
+    # Dengesizlik & scale_pos_weight
     y_train = train[args.target].astype(np.int8).values
     pos = int((y_train == 1).sum())
     neg = int((y_train == 0).sum())
     spw = float(neg / max(1, pos)) if pos > 0 else 1.0
 
-    # İsteğe bağlı negatif undersample
-    if args.undersample and 0.0 < args.undersample < 0.95:
+    # Opsiyonel negatif undersample (train)
+    if args.undersample and 0.0 < args.undersample < 1.0:
         neg_idx = train.index[train[args.target] == 0].to_numpy()
         pos_idx = train.index[train[args.target] == 1].to_numpy()
-        keep_neg = int(len(neg_idx) * (1.0 - float(args.undersample)))
+        keep_neg = int(len(neg_idx) * float(args.undersample))  # oran: tutulacak NEGATIF yüzdesi
         if keep_neg < len(neg_idx):
             rng = np.random.default_rng(42)
             keep_neg_idx = rng.choice(neg_idx, size=keep_neg, replace=False)
@@ -171,7 +165,7 @@ def main():
     )
 
     clf = XGBClassifier(
-        n_estimators=700 if args.freq != "hourly" else 600,
+        n_estimators=700,
         max_depth=6,
         learning_rate=0.06,
         subsample=0.9,
@@ -203,9 +197,9 @@ def main():
     print("Classification report:")
     print(classification_report(y_test, y_pred_best, digits=4))
 
-    # Aşırı iyi metrik uyarısı (sızıntı alarmı)
+    # Aşırı iyi metrik uyarısı
     if ap > 0.95:
-        print("⚠️  UYARI: PR-AUC > 0.95 — tipik olarak sızıntı göstergesidir. "
+        print("⚠️  UYARI: PR-AUC > 0.95 — tipik sızıntı göstergesi. "
               "Feature set ve zaman splitini yeniden kontrol edin.")
 
     # Çıktılar
@@ -225,7 +219,6 @@ def main():
     }
     with open(args.report_out, "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
-
 
 if __name__ == "__main__":
     main()
