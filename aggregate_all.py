@@ -105,6 +105,8 @@ def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: List[str]) -
         out[f"prior_cnt_{suffix}"] = cnt.to_numpy().astype("float32")
         return out.reset_index()
 
+    df = df.sort_values(['GEOID','t'])       
+    df['crime_event'] = df['crime_event'].shift(1)  
     out = df.groupby(grp_cols, group_keys=False).apply(_roll)
     hours_in_window = float(pd.Timedelta(window.lower()) / pd.Timedelta("1h"))  # ⚠️ lower()
     out[f"prior_p_{suffix}"] = (out[f"prior_cnt_{suffix}"] / hours_in_window).astype("float32")
