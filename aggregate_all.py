@@ -93,18 +93,15 @@ def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: List[str], t
     except TypeError:
         tmp = df.groupby(grp_cols, group_keys=True).apply(_roll)
 
-    # Grup anahtarlarını ve time_col'u sütuna indir
     tmp = tmp.reset_index()
     if time_col not in tmp.columns:
-        # olağan dışı bir durum; yine de UTC'ye çevir
         tmp.rename(columns={"index": time_col}, inplace=True)
+
     hours_in_window = float(pd.Timedelta(window) / pd.Timedelta("1h"))
     tmp[f"prior_p_{suffix}"] = (tmp[f"prior_cnt_{suffix}"] / hours_in_window).astype("float32")
 
     tmp["GEOID"] = tmp["GEOID"].astype(str)
     tmp[time_col] = pd.to_datetime(tmp[time_col], utc=True)
-
-    # Orijinal kolonlardan eksilen yok; out tüm kolonları + yeni prior’ları içerir
     return tmp
 
 def _normalize_1d(df: pd.DataFrame) -> pd.DataFrame:
@@ -144,22 +141,40 @@ def _normalize_1d(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def _pick_numeric_cols(df: pd.DataFrame) -> List[str]:
+    # PROTECTED hariç tüm numerikler
     return [c for c in df.columns if c not in PROTECTED and pd.api.types.is_numeric_dtype(df[c])]
+
+def _series_or_zero(df: pd.DataFrame, col: str) -> pd.Series:
+    """Kolon yoksa index uzunluğunda 0 serisi döndür."""
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors="coerce").fillna(0)
+    return pd.Series(0, index=df.index, dtype="float32")
 
 def _agg_block(df: pd.DataFrame, key_time: str) -> pd.DataFrame:
     """
     GEOID × key_time bazında agregasyon (SUM/MEAN) + etiket + takvim + priors
     """
     num_cols = _pick_numeric_cols(df)
+
+    # 1) crime_count'ı açıkça SUM olarak ekle (PROTECTED'ta olduğu için num_cols'a girmez)
     agg_map: Dict[str, str] = {}
+    if "crime_count" in df.columns and pd.api.types.is_numeric_dtype(df["crime_count"]):
+        agg_map["crime_count"] = "sum"
+
+    # 2) Diğer numerikler: MEAN
     for c in num_cols:
-        agg_map[c] = "sum" if c in SUM_COLS else "mean"
+        if c not in agg_map:
+            agg_map[c] = "mean"
 
     gcols = ["GEOID", key_time]
-    out = df.groupby(gcols, as_index=False).agg(agg_map)
+    out = df.groupby(gcols, as_index=False).agg(agg_map) if agg_map else df.groupby(gcols, as_index=False).size()
+    if "size" in out.columns and "crime_count" not in out.columns:
+        # size kolonu istemiyoruz; sadece zaman damgasını taşıyacağız
+        out = out.drop(columns=["size"])
 
     # Etiket (>=1 olay?)
-    out["Y_label"] = (out.get("crime_count", 0) > 0).astype("int8")
+    cc = _series_or_zero(out, "crime_count")
+    out["Y_label"] = (cc > 0).astype("int8")
 
     # t0 olarak yazalım
     out = out.rename(columns={key_time: "t0"})
@@ -182,7 +197,7 @@ def _up_agg_1w(df1d: pd.DataFrame) -> pd.DataFrame:
 
 def _up_agg_1m(df1d: pd.DataFrame) -> pd.DataFrame:
     df = df1d.copy()
-    df["__t_month"] = month_start_utc(df["t0"])  # ← güvenli ay başlangıcı
+    df["__t_month"] = month_start_utc(df["t0"])  # güvenli ay başlangıcı
     return _agg_block(df, "__t_month")
 
 def _save(df: pd.DataFrame, path: Path) -> None:
