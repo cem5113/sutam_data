@@ -114,15 +114,32 @@ jobs:
           test -s "${OUT_PQ}" || { echo "❌ Output parquet yok: ${OUT_PQ}"; exit 1; }
           [ -f "${DATA_DIR}/y_label_stats.csv" ] && { echo "Y_label stats:"; cat "${DATA_DIR}/y_label_stats.csv" || true; }
 
-      - name: Aggregate multi-windows (1D,1W,1M)
+      - name: Aggregate multi-windows (1D tabanlı)
         shell: bash
         run: |
           set -euo pipefail
           echo "▶️  aggregate_all.py (${{ github.event.inputs.windows }})"
+
+          # Sadece 1D,1W,1M'e izin ver (3H/8H gelirse filtrelenir)
+          RAW="${{ github.event.inputs.windows }}"
+          RAW="${RAW// /}"
+          ALLOWED=("1D" "1W" "1M")
+          SEL=()
+          IFS=',' read -r -a PARTS <<< "$RAW"
+          for w in "${PARTS[@]}"; do
+            for ok in "${ALLOWED[@]}"; do
+              if [[ "$w" == "$ok" ]]; then SEL+=("$w"); fi
+            done
+          done
+          if [[ ${#SEL[@]} -eq 0 ]]; then SEL=("1D"); fi
+          FREQS="$(IFS=,; echo "${SEL[*]}")"
+          echo "→ Kullanılacak frekanslar: ${FREQS}"
+
+          # DİKKAT: --tz parametresi yok
           python -u aggregate_all.py \
             --input "${{ env.DATA_DIR }}/${{ env.OUT_FILE }}" \
-            --freqs "${{ github.event.inputs.windows }}" \
-            --tz America/Los_Angeles
+            --freqs "${FREQS}"
+
           ls -lh sf_crime_grid_*.parquet || true
 
       - name: Train multi-windows (sızıntı-safe)
@@ -130,11 +147,27 @@ jobs:
         run: |
           set -euo pipefail
           echo "▶️  train_multi_windows.py"
+          # Eğitim frekanslarını aynı şekilde 1D/1W/1M ile sınırla
+          RAW="${{ github.event.inputs.windows }}"
+          RAW="${RAW// /}"
+          ALLOWED=("1D" "1W" "1M")
+          SEL=()
+          IFS=',' read -r -a PARTS <<< "$RAW"
+          for w in "${PARTS[@]}"; do
+            for ok in "${ALLOWED[@]}"; do
+              if [[ "$w" == "$ok" ]]; then SEL+=("$w"); fi
+            done
+          done
+          if [[ ${#SEL[@]} -eq 0 ]]; then SEL=("1D"); fi
+          FREQS="$(IFS=,; echo "${SEL[*]}")"
+          echo "→ Eğitim frekansları: ${FREQS}"
+
           python -u train_multi_windows.py \
             --dir "." \
             --prefix "sf_crime_grid_" \
-            --freqs "${{ github.event.inputs.windows }}" \
+            --freqs "${FREQS}" \
             --undersample "0.0"
+
           ls -lh models || true
           ls -lh reports || true
 
@@ -143,9 +176,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ -f risk_forecast.py ]; then
-            echo "▶️  risk_forecast.py (freq=auto, horizon=${{ github.event.inputs.horizon }}, topk=${{ github.event.inputs.topk }})"
+            echo "▶️  risk_forecast.py (freq=1D, horizon=${{ github.event.inputs.horizon }}, topk=${{ github.event.inputs.topk }})"
+            # Otomatik seçim 3H'e düşebileceği için 1D'e sabitliyoruz
             python -u risk_forecast.py \
-              --freq auto \
+              --freq 1D \
               --horizon "${{ github.event.inputs.horizon }}" \
               --topk "${{ github.event.inputs.topk }}"
             ls -lh forecasts || true
