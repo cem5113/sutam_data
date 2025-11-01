@@ -15,7 +15,7 @@ Notlar
 from __future__ import annotations
 import argparse
 from pathlib import Path
-from typing import List, Sequence
+from typing import List, Sequence, Dict
 
 import numpy as np
 import pandas as pd
@@ -26,6 +26,7 @@ PROTECTED = {
     "year", "month", "day_of_week", "hour_start", "block_id",
     "crime_count"
 }
+SUM_COLS = {"crime_count"}  # pencerede SUM; diğer numerikler MEAN
 
 # ——— Yardımcılar
 def _ensure_geoid(df: pd.DataFrame) -> pd.DataFrame:
@@ -38,16 +39,31 @@ def _ensure_geoid(df: pd.DataFrame) -> pd.DataFrame:
         return df
     raise SystemExit("GEOID/geoid kolonu bulunamadı.")
 
+def _as_utc_ts(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, utc=True, errors="coerce")
+
 def _add_calendar_from_t0(df: pd.DataFrame) -> pd.DataFrame:
     s = pd.to_datetime(df["t0"], utc=True)
     df["year"]        = s.dt.year.astype("int16")
     df["month"]       = s.dt.month.astype("int8")
     df["day_of_week"] = s.dt.dayofweek.astype("int8")
-    # 1D/1W/1M için hour_start = 0 tutulur
-    df["hour_start"]  = np.int8(0)
+    df["hour_start"]  = np.int8(0)  # 1D/1W/1M için 0
     return df
 
-def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: list[str], time_col: str = "t0") -> pd.DataFrame:
+def week_start_utc(t0: pd.Series) -> pd.Series:
+    # 7 günlük bloklar (fixed) — floor('7D') güvenli
+    s = _as_utc_ts(t0)
+    return s.dt.floor("7D")
+
+def month_start_utc(t0: pd.Series) -> pd.Series:
+    """
+    Aylık başlangıcı güvenle üret (floor('MS')/Period → tz problemlerini önler).
+    """
+    s = _as_utc_ts(t0)
+    ms = pd.to_datetime({"year": s.dt.year, "month": s.dt.month, "day": 1}, utc=True)
+    return ms
+
+def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: List[str], time_col: str = "t0") -> pd.DataFrame:
     """
     df: GEOID, time_col (UTC), Y_label ... içerir.
     keys: ["day_of_week", ...]
@@ -62,9 +78,7 @@ def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: list[str], t
     df["GEOID"] = df["GEOID"].astype(str)
     keys = [k for k in (keys or []) if k in df.columns]
 
-    # Sıralama
     df = df.sort_values(["GEOID", time_col])
-
     grp_cols = ["GEOID", *keys]
 
     def _roll(g: pd.DataFrame) -> pd.DataFrame:
@@ -74,40 +88,23 @@ def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: list[str], t
         out[f"prior_cnt_{suffix}"] = cnt.astype("float32").to_numpy()
         return out
 
-    # Grup uygula (grup anahtarlarını index’ten SÜREKLİ geri al)
     try:
         tmp = df.groupby(grp_cols, group_keys=True).apply(_roll, include_groups=False)
     except TypeError:
-        # Eski pandas: include_groups yok → default davranış
         tmp = df.groupby(grp_cols, group_keys=True).apply(_roll)
 
-    # Grup anahtarlarını tekrar sütuna çıkar
-    if isinstance(tmp.index, pd.MultiIndex):
-        # son seviye time_col (index), ilk N seviye grup anahtarları
-        # reset_index ile hepsini kolona indiriyoruz
-        tmp = tmp.reset_index()  # -> cols: grp_cols..., time_col
-        # Güvenlik: isimler beklediğimiz gibi değilse yeniden adlandır
-        if time_col not in tmp.columns:
-            # reset_index gerekirse farklı isim vermiş olabilir
-            # ama normalde burada time_col yerinde olacak
-            pass
-    else:
-        # Tek anahtar + time_col index olabilir
-        # Eğer time_col index’te ise indir:
-        if tmp.index.name == time_col:
-            tmp = tmp.reset_index()
-        # GEOID kolonu yoksa index grup anahtarıdır
-        if "GEOID" not in tmp.columns and tmp.index.name == "GEOID":
-            tmp = tmp.reset_index()
-
-    # Saat penceresi
+    # Grup anahtarlarını ve time_col'u sütuna indir
+    tmp = tmp.reset_index()
+    if time_col not in tmp.columns:
+        # olağan dışı bir durum; yine de UTC'ye çevir
+        tmp.rename(columns={"index": time_col}, inplace=True)
     hours_in_window = float(pd.Timedelta(window) / pd.Timedelta("1h"))
     tmp[f"prior_p_{suffix}"] = (tmp[f"prior_cnt_{suffix}"] / hours_in_window).astype("float32")
 
-    # Tip düzeltmeleri
     tmp["GEOID"] = tmp["GEOID"].astype(str)
     tmp[time_col] = pd.to_datetime(tmp[time_col], utc=True)
 
+    # Orijinal kolonlardan eksilen yok; out tüm kolonları + yeni prior’ları içerir
     return tmp
 
 def _normalize_1d(df: pd.DataFrame) -> pd.DataFrame:
@@ -122,12 +119,11 @@ def _normalize_1d(df: pd.DataFrame) -> pd.DataFrame:
     if miss:
         raise SystemExit(f"1D normalize: eksik kolon(lar): {miss}")
 
-    # t0 UTC normalize
-    df["t0"] = pd.to_datetime(df["t0"], utc=True, errors="coerce")
+    df["t0"] = _as_utc_ts(df["t0"])
     if df["t0"].isna().any():
         raise SystemExit("1D normalize: t0 parse edilemedi (NaT var).")
 
-    # Etiket: günlük pencerede >=1 olay?
+    # Etiket: pencerede ≥1 olay?
     df["Y_label"] = (pd.to_numeric(df["crime_count"], errors="coerce").fillna(0) > 0).astype("int8")
 
     # Takvim kolonları
@@ -144,56 +140,50 @@ def _normalize_1d(df: pd.DataFrame) -> pd.DataFrame:
     df = prior_rolling(df, "28D",  "28d",  keys=["day_of_week"], time_col="t0")
     df = prior_rolling(df, "180D", "180d", keys=["day_of_week"], time_col="t0")
 
-    # Sırala & kolonları düzenle
-    keep = [c for c in df.columns if c not in {"t0_local"}]
-    out = df[keep].sort_values(["GEOID", "t0"]).reset_index(drop=True)
+    out = df[[c for c in df.columns if c != "t0_local"]].sort_values(["GEOID", "t0"]).reset_index(drop=True)
     return out
 
-def _up_agg(df_1d: pd.DataFrame, target: str) -> pd.DataFrame:
+def _pick_numeric_cols(df: pd.DataFrame) -> List[str]:
+    return [c for c in df.columns if c not in PROTECTED and pd.api.types.is_numeric_dtype(df[c])]
+
+def _agg_block(df: pd.DataFrame, key_time: str) -> pd.DataFrame:
     """
-    1D → 1W veya 1M toplama.
-    - crime_count: SUM
-    - diğer numerikler: MEAN
+    GEOID × key_time bazında agregasyon (SUM/MEAN) + etiket + takvim + priors
     """
-    if target not in {"1W", "1M"}:
-        raise ValueError("target 1W veya 1M olmalı.")
+    num_cols = _pick_numeric_cols(df)
+    agg_map: Dict[str, str] = {}
+    for c in num_cols:
+        agg_map[c] = "sum" if c in SUM_COLS else "mean"
 
-    df = df_1d.copy()
-
-    # Zamanı hedef periyoda yuvarla (tz-aware, UTC)
-    if target == "1W":
-        t_floor = pd.to_datetime(df["t0"], utc=True).dt.floor("7D")
-    else:  # "1M"
-        # Aylık başa güvenli floor (Period → tz hatasını engeller)
-        t_floor = pd.to_datetime(df["t0"], utc=True).dt.floor("MS")
-
-    df["__t_floor"] = t_floor
-
-    # Toplanacak numeric kolonlar (korumalı olanlar hariç)
-    num_cols = [c for c in df.columns if c not in PROTECTED and pd.api.types.is_numeric_dtype(df[c])]
-    agg_map = {"crime_count": "sum"}
-    agg_map.update({c: "mean" for c in num_cols})
-
-    gkeys = ["GEOID", "__t_floor"]
-    agg = df.groupby(gkeys, as_index=False).agg(agg_map)
+    gcols = ["GEOID", key_time]
+    out = df.groupby(gcols, as_index=False).agg(agg_map)
 
     # Etiket (>=1 olay?)
-    agg["Y_label"] = (agg["crime_count"] > 0).astype("int8")
+    out["Y_label"] = (out.get("crime_count", 0) > 0).astype("int8")
 
     # t0 olarak yazalım
-    agg = agg.rename(columns={"__t_floor": "t0"})
-    agg["t0"] = pd.to_datetime(agg["t0"], utc=True)
+    out = out.rename(columns={key_time: "t0"})
+    out["t0"] = _as_utc_ts(out["t0"])
 
-    # Takvim kolonları
-    agg = _add_calendar_from_t0(agg)
+    # Takvim alanları
+    out = _add_calendar_from_t0(out)
 
     # Priors (day_of_week ile)
-    agg = prior_rolling(agg, "28D",  "28d",  keys=["day_of_week"], time_col="t0")
-    agg = prior_rolling(agg, "180D", "180d", keys=["day_of_week"], time_col="t0")
+    out = prior_rolling(out, "28D",  "28d",  keys=["day_of_week"], time_col="t0")
+    out = prior_rolling(out, "180D", "180d", keys=["day_of_week"], time_col="t0")
 
-    # Çıkış
-    out = agg.sort_values(["GEOID", "t0"]).reset_index(drop=True)
+    out = out.sort_values(["GEOID", "t0"]).reset_index(drop=True)
     return out
+
+def _up_agg_1w(df1d: pd.DataFrame) -> pd.DataFrame:
+    df = df1d.copy()
+    df["__t_week"] = week_start_utc(df["t0"])
+    return _agg_block(df, "__t_week")
+
+def _up_agg_1m(df1d: pd.DataFrame) -> pd.DataFrame:
+    df = df1d.copy()
+    df["__t_month"] = month_start_utc(df["t0"])  # ← güvenli ay başlangıcı
+    return _agg_block(df, "__t_month")
 
 def _save(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -215,13 +205,6 @@ def main():
     if not src.exists():
         raise SystemExit(f"Girdi yok: {src.resolve()}")
 
-    # Oku
-    df0 = pd.read_parquet(src)
-    df0 = _ensure_geoid(df0)
-
-    if "t0" not in df0.columns:
-        raise SystemExit("Bu script günlük (1D) girdiler içindir; 't0' kolonu zorunlu.")
-
     req = [f.strip().upper() for f in args.freqs.split(",") if f.strip()]
     allowed = {"1D", "1W", "1M"}
     bad = [f for f in req if f not in allowed]
@@ -230,17 +213,20 @@ def main():
 
     print(f"▶️  aggregate_all.py ({','.join(req)})")
 
-    # 1D normalize
+    # Oku & normalize 1D
+    df0 = pd.read_parquet(src)
+    df0 = _ensure_geoid(df0)
+    if "t0" not in df0.columns:
+        raise SystemExit("Bu script günlük (1D) girdiler içindir; 't0' kolonu zorunlu.")
     out_1d = _normalize_1d(df0)
+
     if "1D" in req:
         _save(out_1d, Path("sf_crime_grid_1d.parquet"))
-
-    # 1W / 1M yukarı toplama
     if "1W" in req:
-        out_1w = _up_agg(out_1d, "1W")
+        out_1w = _up_agg_1w(out_1d)
         _save(out_1w, Path("sf_crime_grid_1w.parquet"))
     if "1M" in req:
-        out_1m = _up_agg(out_1d, "1M")
+        out_1m = _up_agg_1m(out_1d)
         _save(out_1m, Path("sf_crime_grid_1m.parquet"))
 
 if __name__ == "__main__":
