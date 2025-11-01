@@ -1,17 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
 aggregate_windows.py — calendar-day 1D, runtime-anchored others
-- Saatlik full-grid verisini (GEOID × dt) alır (dt: UTC-aware, saatlik)
-- Pencereler: 3H, 8H (runtime-anchored), 1D (TAKVİM GÜNÜ), 1W=7D ve 1M=30D (runtime-anchored)
-- Y_label: pencerede >=1 olay varsa 1 (crime_count>0 toplamsal)
-- Numerikler: crime_count SUM, diğer numeric kolonlar MEAN
-- Priors (sızıntısız): 28D ve 180D rolling, anahtarlar:
-    * 3H/8H: GEOID × day_of_week × block_id
-    * 1D/1W/1M: GEOID × day_of_week
-- Çıktı parquet (tüm zaman damgaları UTC). t0: pencere başlangıcı (UTC)
-"""
 
 import argparse
 from pathlib import Path
@@ -41,7 +31,7 @@ def _ensure_geoid(df: pd.DataFrame) -> pd.DataFrame:
     raise SystemExit("GEOID/geoid kolonu bulunamadı.")
 
 def _anchored_floor(series: pd.Series, freq: str, tz: Optional[str]) -> pd.Series:
-    """3H/8H/1W/1M için origin=run-day, 1D özel (takvim)."""
+    """1W/1M için origin=run-day, 1D özel (takvim)."""
     anchor = _now_tz(tz)
     origin = anchor.floor("D")
     s = pd.to_datetime(series)
@@ -65,22 +55,11 @@ def to_local(s_utc: pd.Series, tz: Optional[str]) -> pd.Series:
 
 def make_t0_and_block(dt_local: pd.Series, freq: str, tz: Optional[str]) -> Tuple[pd.Series, Optional[pd.Series]]:
     """
-    3H/8H: block_id üretir (gün içi blok: 3H→0..7, 8H→0..2), origin=run-day0
     1D: **takvim günü** (yerel TZ’de 00:00), block_id yok
     1W: 7 günlük pencereler (runtime-anchored)
     1M: 30 günlük pencereler (runtime-anchored)
     """
-    if freq == "3H":
-        t0_local = _anchored_floor(dt_local, "3H", tz)
-        day0 = _anchored_day0(dt_local, tz)
-        hrs_since = (dt_local.view("int64") - day0.view("int64")) / 3_600_000_000_000
-        block_id = (np.floor(hrs_since / 3.0)).astype("int8")  # 0..7
-    elif freq == "8H":
-        t0_local = _anchored_floor(dt_local, "8H", tz)
-        day0 = _anchored_day0(dt_local, tz)
-        hrs_since = (dt_local.view("int64") - day0.view("int64")) / 3_600_000_000_000
-        block_id = (np.floor(hrs_since / 8.0)).astype("int8")  # 0..2
-    elif freq == "1D":
+    if freq == "1D":
         # TAKVİM GÜNÜ (origin kullanılmaz)
         t0_local = pd.to_datetime(dt_local).dt.floor("1D")
         block_id = None
@@ -134,7 +113,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--input", type=Path, required=True, help="Saatlik full-grid (GEOID×dt) parquet")
     p.add_argument("--out",   type=Path, required=True, help="Çıktı parquet")
-    p.add_argument("--freq",  type=str, choices=["3H","8H","1D","1W","1M"], required=True)
+    p.add_argument("--freq",  type=str, choices=["1D","1W","1M"], required=True)
     p.add_argument("--tz",    type=str, default=None, help="Yerel zaman (örn. America/Los_Angeles)")
     return p.parse_args()
 
@@ -218,14 +197,14 @@ def main():
         if col in agg.columns:
             agg[col] = pd.to_numeric(agg[col], errors="coerce").fillna(-1).astype("int8")
 
-    # 9) Priors (t0 üzerinden, sızıntısız)
-    if "block_id" in agg.columns:
-        season_keys = ["day_of_week", "block_id"]  # 3H/8H
-    else:
-        season_keys = ["day_of_week"]              # 1D/1W/1M
-
-    agg = prior_rolling(agg, window="28D",  suffix="28d",  keys=season_keys)
-    agg = prior_rolling(agg, window="180D", suffix="180d", keys=season_keys)
+   # 9) Priors (t0 üzerinden, sızıntısız; 3H/8H yok → block_id yok)
+   if "day_of_week" not in agg.columns:
+       agg["day_of_week"] = pd.to_datetime(agg["t0"], utc=True).dt.dayofweek.astype("int8")
+   
+   season_keys = ["day_of_week"]  # 1D/1W/1M
+   
+   agg = prior_rolling(agg, window="28D",  suffix="28d",  keys=season_keys)
+   agg = prior_rolling(agg, window="180D", suffix="180d", keys=season_keys)
 
     # 10) Sırala + t0_local'ı düşür + yaz
     order_cols = ["GEOID", "t0"] + (["block_id"] if "block_id" in agg.columns else [])
