@@ -144,17 +144,44 @@ def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: list[str], t
         raise KeyError(f"time_col '{time_col}' bulunamadı. Kolonlar: {list(df.columns)[:20]}...")
     if "Y_label" not in df.columns:
         raise KeyError("prior_rolling için 'Y_label' zorunlu.")
-    df = _ensure_geoid(df)
+    df = _ensure_geoid(df).copy()
 
     df = df.sort_values(["GEOID", time_col]).copy()
-    grp_cols = ["GEOID"] + [k for k in keys if k in df.columns]
+    keys = [k for k in keys if k in df.columns]
+    grp_cols = ["GEOID"] + keys
 
     def _roll(g: pd.DataFrame) -> pd.DataFrame:
+        # Grup anahtarlarını güvenceye al (pandas sürüm farklılıklarına karşı)
+        # g.name -> ('GEOID', *keys) veya tekil değer olabilir
+        if hasattr(g, "name"):
+            name = g.name
+            if not isinstance(name, tuple):
+                name = (name,)
+        else:
+            name = tuple()
+
+        # Beklenen sırada değerleri çöz
+        key_vals = {}
+        if len(name) == len(grp_cols):
+            key_vals = dict(zip(grp_cols, name))
+        else:
+            # Yedek: g içinden oku (çoğu sürümde kolonlar mevcut)
+            for k in grp_cols:
+                if k in g.columns:
+                    key_vals[k] = g[k].iloc[0]
+
         g = g.sort_values(time_col).set_index(time_col)
         cnt = g["Y_label"].rolling(window=window).sum().shift(1).fillna(0.0)
-        g = g.reset_index()
-        g[f"prior_cnt_{suffix}"] = cnt.to_numpy().astype("float32")
-        return g
+
+        out = g.copy()
+        out[f"prior_cnt_{suffix}"] = cnt.to_numpy().astype("float32")
+        out = out.reset_index()
+
+        # Grup anahtarlarını açıkça ekle
+        for k, v in key_vals.items():
+            if k not in out.columns:
+                out[k] = v
+        return out
 
     try:
         out = df.groupby(grp_cols, group_keys=False).apply(_roll, include_groups=False)
@@ -163,9 +190,12 @@ def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: list[str], t
 
     hours_in_window = float(pd.Timedelta(window) / pd.Timedelta("1h"))
     out[f"prior_p_{suffix}"] = (out[f"prior_cnt_{suffix}"] / hours_in_window).astype("float32")
-    return _ensure_geoid(out)
 
-
+    # Sütunları standartla ve güvenceye al
+    out = _ensure_geoid(out)
+    out = out.sort_values(["GEOID", time_col]).reset_index(drop=True)
+    return out
+  
 # -------------------------
 # Saatlik girdiden tek-frekans agregasyon
 # -------------------------
