@@ -10,7 +10,7 @@ on:
         default: artifact
       windows:
         description: "Multi-window frekansları (virgülle): 3H,8H,1D,1W,1M"
-        default: "3H,8H,1D,1W,1M"
+        default: "1D"
       horizon:
         description: "Forecast ufku (örn: 72h, 30d, 12w)"
         default: "72h"
@@ -49,16 +49,33 @@ jobs:
           cache: "pip"
           cache-dependency-path: requirements.txt
 
-      - name: Install dependencies
+      - name: Install dependencies (pinned)
         run: |
+          set -euo pipefail
           python -m pip install -U pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install numpy pandas pyarrow tqdm scipy \
-                        scikit-learn xgboost lightgbm imbalanced-learn \
-                        joblib matplotlib
+            pip install \
+              "pandas>=2.2.2,<2.3" \
+              "pyarrow>=15,<19" \
+              "numpy>=1.26,<2.0" \
+              "scipy>=1.11,<1.13" \
+              "scikit-learn>=1.4,<1.6" \
+              "xgboost>=2.0,<2.1" \
+              "lightgbm>=4.3,<5" \
+              "imbalanced-learn>=0.12,<0.13" \
+              joblib matplotlib tqdm
           fi
+          python - <<'PY'
+          import sys, pandas, sklearn, xgboost, lightgbm
+          print("VERSIONS:",
+                "py", sys.version.split()[0],
+                "pandas", pandas.__version__,
+                "sklearn", sklearn.__version__,
+                "xgb", xgboost.__version__,
+                "lgbm", lightgbm.__version__)
+          PY
 
       - name: Detect input parquet & optional files
         id: detect
@@ -106,7 +123,7 @@ jobs:
           test -s "${OUT_PQ}" || { echo "❌ Output parquet yok: ${OUT_PQ}"; exit 1; }
           [ -f "${DATA_DIR}/y_label_stats.csv" ] && { echo "Y_label stats:"; cat "${DATA_DIR}/y_label_stats.csv" || true; }
 
-      - name: Aggregate multi-windows (3H/8H/1D/1W/1M)
+      - name: Aggregate multi-windows
         shell: bash
         run: |
           set -euo pipefail
@@ -115,8 +132,9 @@ jobs:
             --input "${{ env.DATA_DIR }}/${{ env.OUT_FILE }}" \
             --freqs "${{ github.event.inputs.windows }}" \
             --tz America/Los_Angeles
+          ls -lh sf_crime_grid_*.parquet || true
 
-      - name: Train multi-windows (3H/8H/1D/1W/1M)
+      - name: Train multi-windows (sızıntı-safe)
         shell: bash
         run: |
           set -euo pipefail
@@ -126,8 +144,10 @@ jobs:
             --prefix "sf_crime_grid_" \
             --freqs "${{ github.event.inputs.windows }}" \
             --undersample "0.0"
+          ls -lh models || true
+          ls -lh reports || true
 
-      - name: Run risk_forecast (multi-window predictions) — optional
+      - name: Run risk_forecast (optional)
         shell: bash
         run: |
           set -euo pipefail
@@ -155,6 +175,7 @@ jobs:
             models/*.joblib
             reports/*.json
             reports/*.csv
+            reports/*.txt
             forecasts/*.*
           if-no-files-found: warn
           retention-days: 14
@@ -177,7 +198,7 @@ jobs:
             echo "No changes to commit."
             exit 0
           fi
-          git commit -m "chore: labels+priors, multi-window aggregation/training & forecasts"
+          git commit -m "chore: labels+priors, daily-first aggregation/training & forecasts"
           git push origin "${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}"
 
       - name: Job summary
