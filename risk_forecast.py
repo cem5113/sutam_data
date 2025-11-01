@@ -52,7 +52,7 @@ def now_utc() -> pd.Timestamp:
 
 def pick_freq_auto(h: str) -> str:
     s = h.lower().strip()
-    if   s.endswith("h"): hours = float(s[:-1])
+    if   s.endswith("1h"): hours = float(s[:-1])
     elif s.endswith("d"): hours = float(s[:-1]) * 24
     elif s.endswith("w"): hours = float(s[:-1]) * 24 * 7
     elif s.endswith("m"): hours = float(s[:-1]) * 24 * 30
@@ -64,7 +64,7 @@ def pick_freq_auto(h: str) -> str:
 
 def parse_horizon(h: str) -> timedelta:
     s = h.lower().strip()
-    if   s.endswith("h"): return timedelta(hours=float(s[:-1]))
+    if   s.endswith("1h"): return timedelta(hours=float(s[:-1]))
     if   s.endswith("d"): return timedelta(days=float(s[:-1]))
     if   s.endswith("w"): return timedelta(weeks=float(s[:-1]))
     if   s.endswith("m"): return timedelta(days=float(s[:-1]) * 30)
