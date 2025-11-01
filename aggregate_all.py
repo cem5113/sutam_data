@@ -41,28 +41,49 @@ def add_calendar_cols(df: pd.DataFrame, tcol: str) -> pd.DataFrame:
     return df
 
 def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: list[str], time_col: str = "t0") -> pd.DataFrame:
+    """
+    Leakage-safe prior: geçmiş pencere toplami (shift(1)) + saat normalize p.
+    Grup anahtarlarını (GEOID + keys) apply sonrasında MANUEL olarak ekler.
+    """
     if time_col not in df.columns:
         raise KeyError(f"time_col '{time_col}' yok.")
     if "Y_label" not in df.columns:
         raise KeyError("prior_rolling için 'Y_label' zorunlu.")
     df = _ensure_geoid(df).sort_values(["GEOID", time_col]).copy()
+
     grp_cols = ["GEOID"] + [k for k in keys if k in df.columns]
+    gobj = df.groupby(grp_cols, group_keys=False)
 
     def _roll(g: pd.DataFrame) -> pd.DataFrame:
-        g = g.sort_values(time_col).set_index(time_col)
-        cnt = g["Y_label"].rolling(window=window).sum().shift(1).fillna(0.0)
-        g = g.reset_index()
-        g[f"prior_cnt_{suffix}"] = cnt.to_numpy().astype("float32")
-        return g
+        # g.name: tek anahtar için skaler, çoklu için tuple
+        if isinstance(g.name, tuple):
+            key_vals = list(g.name)
+        else:
+            key_vals = [g.name]
+        # Orijinal frame’den sadece zaman ve Y_label ile çalış
+        gg = g.sort_values(time_col).set_index(time_col)
+        cnt = gg["Y_label"].rolling(window=window).sum().shift(1).fillna(0.0)
+        out = gg.reset_index().copy()
+        out[f"prior_cnt_{suffix}"] = cnt.to_numpy().astype("float32")
+        # Grup anahtarlarını kolona geri yaz
+        for k, v in zip(grp_cols, key_vals):
+            out[k] = v
+        return out
 
     try:
-        out = df.groupby(grp_cols, group_keys=False).apply(_roll, include_groups=False)
+        out = gobj.apply(_roll, include_groups=False)
     except TypeError:
-        out = df.groupby(grp_cols, group_keys=False).apply(_roll)
+        out = gobj.apply(_roll)
 
+    # Saat cinsinden normalize olasılık benzeri yoğunluk
     hours_in_window = float(pd.Timedelta(window) / pd.Timedelta("1h"))
     out[f"prior_p_{suffix}"] = (out[f"prior_cnt_{suffix}"] / hours_in_window).astype("float32")
-    return _ensure_geoid(out)
+
+    # Kolon sırası/varlığı emniyeti
+    out = _ensure_geoid(out)
+    if time_col not in out.columns:
+        raise KeyError(f"prior_rolling çıktı zaman kolonu kayıp: {time_col}")
+    return out
 
 # ------------ daily input path ------------
 def _normalize_1d(df1d: pd.DataFrame) -> pd.DataFrame:
@@ -84,7 +105,7 @@ def _normalize_1d(df1d: pd.DataFrame) -> pd.DataFrame:
     df = df.loc[:, ~df.columns.duplicated()].copy()
     df = df[[c for c in keep if c in df.columns]].copy()
     df = df.sort_values(["GEOID","t0"]).reset_index(drop=True)
-    # priors
+    # priors (grup anahtarı 'day_of_week')
     df = prior_rolling(df, "28D",  "28d",  keys=["day_of_week"], time_col="t0")
     df = prior_rolling(df, "180D", "180d", keys=["day_of_week"], time_col="t0")
     return df
@@ -120,7 +141,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--input", type=Path, required=True, help="Daily grid (GEOID×t0, crime_count...)")
     p.add_argument("--freqs", type=str, default="1D,1W,1M", help="Desteklenenler: 1D,1W,1M")
-    # İsteğe bağlı: workflow'tan gelen --tz argümanını kabul et (kullanılmıyor)
+    # Workflow'tan gelen --tz argümanını kabul et (kullanılmıyor)
     p.add_argument("--tz", type=str, default=None, help="(opsiyonel) yerel timezone; bu betikte kullanılmaz")
     return p.parse_args()
 
