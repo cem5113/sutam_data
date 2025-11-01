@@ -9,11 +9,11 @@ on:
         options: [artifact, commit, none]
         default: artifact
       windows:
-        description: "Multi-window frekansları (virgülle): 3H,8H,1D,1W,1M"
-        default: "1D"
+        description: "Multi-window frekansları (virgülle): 1D,1W,1M"
+        default: "1D,1W,1M"
       horizon:
-        description: "Forecast ufku (örn: 72h, 30d, 12w)"
-        default: "72h"
+        description: "Forecast ufku (örn: 30d, 90d, 6m)"
+        default: "30d"
       topk:
         description: "Şehir geneli Top-K GEOID"
         default: "50"
@@ -67,15 +67,6 @@ jobs:
               "imbalanced-learn>=0.12,<0.13" \
               joblib matplotlib tqdm
           fi
-          python - <<'PY'
-          import sys, pandas, sklearn, xgboost, lightgbm
-          print("VERSIONS:",
-                "py", sys.version.split()[0],
-                "pandas", pandas.__version__,
-                "sklearn", sklearn.__version__,
-                "xgb", xgboost.__version__,
-                "lgbm", lightgbm.__version__)
-          PY
 
       - name: Detect input parquet & optional files
         id: detect
@@ -123,7 +114,7 @@ jobs:
           test -s "${OUT_PQ}" || { echo "❌ Output parquet yok: ${OUT_PQ}"; exit 1; }
           [ -f "${DATA_DIR}/y_label_stats.csv" ] && { echo "Y_label stats:"; cat "${DATA_DIR}/y_label_stats.csv" || true; }
 
-      - name: Aggregate multi-windows
+      - name: Aggregate multi-windows (1D,1W,1M)
         shell: bash
         run: |
           set -euo pipefail
@@ -198,7 +189,7 @@ jobs:
             echo "No changes to commit."
             exit 0
           fi
-          git commit -m "chore: labels+priors, daily-first aggregation/training & forecasts"
+          git commit -m "chore: labels+priors, 1D/1W/1M aggregation/training & forecasts"
           git push origin "${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}"
 
       - name: Job summary
