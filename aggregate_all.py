@@ -8,7 +8,7 @@ Girdi : Günlük grid parquet (GEOID, t0 [UTC], crime_count, ... numerikler)
 
 Notlar
 - 1D girdiniz yoksa (saatlik 'dt' ile) bu dosya yerine 1D üreten sürümü kullanın.
-- Priors: 28D ve 180D, leakage-safe (shift(1)), anahtarlar:
+- Priors: 28D ve 180D, leakage-safe (closed='left'), anahtarlar:
     * 1D/1W/1M → GEOID × day_of_week
 """
 
@@ -67,7 +67,8 @@ def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: List[str], t
     """
     df: GEOID, time_col (UTC), Y_label ... içerir.
     keys: ["day_of_week", ...]
-    Sızıntısız: shift(1)
+    Sızıntısız: rolling(..., closed='left')  → mevcut günü DÂHİL ETMEZ.
+    Oran: p = (penceredeki Y=1 gün sayısı) / (penceredeki gün sayısı)
     """
     need = {"GEOID", time_col, "Y_label"}
     miss = need - set(df.columns)
@@ -83,9 +84,15 @@ def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: List[str], t
 
     def _roll(g: pd.DataFrame) -> pd.DataFrame:
         g = g.sort_values(time_col).set_index(time_col)
-        cnt = g["Y_label"].rolling(window=window).sum().shift(1).fillna(0.0)
+        y = pd.to_numeric(g["Y_label"], errors="coerce").fillna(0.0)
+        # BUGÜN HARİÇ geçmiş: closed='left'
+        cnt = y.rolling(window=window, closed="left").sum()
+        obs = y.rolling(window=window, closed="left").count()
+        p   = cnt / obs.replace(0, np.nan)
+
         out = g.copy()
         out[f"prior_cnt_{suffix}"] = cnt.astype("float32").to_numpy()
+        out[f"prior_p_{suffix}"]   = p.astype("float32").to_numpy()
         return out
 
     try:
@@ -97,11 +104,13 @@ def prior_rolling(df: pd.DataFrame, window: str, suffix: str, keys: List[str], t
     if time_col not in tmp.columns:
         tmp.rename(columns={"index": time_col}, inplace=True)
 
-    hours_in_window = float(pd.Timedelta(window) / pd.Timedelta("1h"))
-    tmp[f"prior_p_{suffix}"] = (tmp[f"prior_cnt_{suffix}"] / hours_in_window).astype("float32")
-
     tmp["GEOID"] = tmp["GEOID"].astype(str)
     tmp[time_col] = pd.to_datetime(tmp[time_col], utc=True)
+    # NaN oranları 0’a çek (pencere dolmamış başlangıç dönemleri)
+    for c in (f"prior_p_{suffix}",):
+        tmp[c] = tmp[c].fillna(0.0).astype("float32")
+    for c in (f"prior_cnt_{suffix}",):
+        tmp[c] = tmp[c].fillna(0.0).astype("float32")
     return tmp
 
 def _normalize_1d(df: pd.DataFrame) -> pd.DataFrame:
@@ -169,7 +178,6 @@ def _agg_block(df: pd.DataFrame, key_time: str) -> pd.DataFrame:
     gcols = ["GEOID", key_time]
     out = df.groupby(gcols, as_index=False).agg(agg_map) if agg_map else df.groupby(gcols, as_index=False).size()
     if "size" in out.columns and "crime_count" not in out.columns:
-        # size kolonu istemiyoruz; sadece zaman damgasını taşıyacağız
         out = out.drop(columns=["size"])
 
     # Etiket (>=1 olay?)
@@ -197,7 +205,7 @@ def _up_agg_1w(df1d: pd.DataFrame) -> pd.DataFrame:
 
 def _up_agg_1m(df1d: pd.DataFrame) -> pd.DataFrame:
     df = df1d.copy()
-    df["__t_month"] = month_start_utc(df["t0"])  # güvenli ay başlangıcı
+    df["__t_month"] = month_start_utc(df["t0"])
     return _agg_block(df, "__t_month")
 
 def _save(df: pd.DataFrame, path: Path) -> None:
