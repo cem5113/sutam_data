@@ -91,7 +91,7 @@ def _to_dt(df: pd.DataFrame) -> pd.Series:
     if s is None or s.isna().all():
         raise ValueError("Zaman için datetime/(date+time)/event_hour/received_time gerekli.")
     s = _coerce_tz_aware(s).dt.tz_convert("UTC")
-    return s.dt.floor("h")
+    return s.dt.floor("1h")
 
 def _add_calendar(df: pd.DataFrame, base_col: str, tz: Optional[str]) -> pd.DataFrame:
     base = base_col
@@ -140,9 +140,9 @@ def _safe_read_parquet_columns(p: Path, columns: Optional[List[str]] = None) -> 
 # Grid kurucular
 # ---------------------------
 def _build_full_grid_hourly(df: pd.DataFrame) -> pd.DataFrame:
-    dt_min = df["dt"].min().floor("h")
-    dt_max = df["dt"].max().ceil("h")
-    hours = pd.date_range(dt_min, dt_max, freq="h", tz="UTC")
+    dt_min = df["dt"].min().floor("1h")
+    dt_max = df["dt"].max().ceil("1h")
+    hours = pd.date_range(dt_min, dt_max, freq="1h", tz="UTC")
     geoids = df["GEOID"].dropna().astype(str).unique()
     grid = pd.MultiIndex.from_product([geoids, hours], names=["GEOID","dt"]).to_frame(index=False)
     return grid.sort_values(["GEOID","dt"]).reset_index(drop=True)
@@ -177,7 +177,7 @@ def _prior_rolling(df: pd.DataFrame, time_col: str, window: str, suffix: str, ke
     except TypeError:
         out = df.groupby(grp_cols, group_keys=False).apply(_roll)
 
-    hours = float(pd.Timedelta(window) / pd.Timedelta("h"))
+    hours = float(pd.Timedelta(window) / pd.Timedelta("1h"))
     out[f"prior_p_{suffix}"] = (out[f"prior_cnt_{suffix}"] / hours).astype("float32")
     return out
 
